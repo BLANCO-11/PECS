@@ -8,7 +8,7 @@ from extractors import SymbolicExtractor, LLMExtractor
 from config import AlphaConfig
 from confidence import compute_confidence
 
-class AlphaCognitiveCore:
+class PECSCore:
     def __init__(self, groq_api_key: str, deep_think_mode: bool = False):
         self.memory = MemoryStore()
         self.symbolic = SymbolicExtractor()

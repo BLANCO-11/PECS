@@ -1,6 +1,6 @@
 import os
 from dotenv import load_dotenv
-from core import AlphaCognitiveCore
+from core import PECSCore
 
 if __name__ == "__main__":
     load_dotenv()
@@ -9,7 +9,7 @@ if __name__ == "__main__":
     api_key = os.environ.get("GROQ_API_KEY")
     
     # Initialize core (set deep_think_mode=True if you want the deeper reasoning by default)
-    core = AlphaCognitiveCore(api_key)
+    core = PECSCore(api_key)
     
     #  Pure Learning (Feeding Data) - No response generated
     # Good for bulk loading facts cheaply
