@@ -1,1 +1,7 @@
 /venv
+pyc
+__pycache__
+__pycache__/config.cpython-312.pyc
+__pycache__/core.cpython-312.pyc
+__pycache__/extractors.cpython-312.pyc
+__pycache__/storage.cpython-312.pyc

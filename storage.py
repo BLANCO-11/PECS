@@ -61,6 +61,9 @@ class MemoryStore:
         cur = self.conn.cursor()
         now = time.time()
         
+        b_id = None
+        is_new = False
+
         # Check existence
         cur.execute("SELECT id, evidence_score FROM beliefs WHERE subject=? AND predicate=? AND object=?", 
                     (subj, pred, obj))
@@ -68,21 +71,61 @@ class MemoryStore:
         
         if row:
             # Update existing
+            b_id = row['id']
             new_score = row['evidence_score'] + weight
             cur.execute("""
                 UPDATE beliefs 
                 SET evidence_score = ?, last_updated = ?, usage_count = usage_count + 1 
                 WHERE id = ?
-            """, (new_score, now, row['id']))
-            return row['id'], False # False = not new
+            """, (new_score, now, b_id))
+            is_new = False
         else:
             # Insert new
-            new_id = str(uuid.uuid4())
+            b_id = str(uuid.uuid4())
             cur.execute("""
                 INSERT INTO beliefs (id, type, subject, predicate, object, last_updated, evidence_score)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (new_id, b_type, subj, pred, obj, now, weight))
-            return new_id, True # True = new
+            """, (b_id, b_type, subj, pred, obj, now, weight))
+            is_new = True
+
+        # Contradiction Detection
+        self._check_contradictions(b_id, subj, pred, obj)
+
+        return b_id, is_new
+
+    def _check_contradictions(self, b_id, subj, pred, obj):
+        """Detects simple contradictions and adds edges."""
+        cur = self.conn.cursor()
+
+        def add_conflict(id1, id2):
+            # Check if connection already exists to prevent score inflation
+            cur.execute("SELECT 1 FROM edges WHERE source_id=? AND target_id=? AND type='contradicts'", (id1, id2))
+            if cur.fetchone():
+                return # Already marked
+            
+            self.add_edge(id1, id2, 'contradicts', weight=1.0)
+            self.add_edge(id2, id1, 'contradicts', weight=1.0)
+            self._increment_contradiction(id1)
+            self._increment_contradiction(id2)
+        
+        # 1. Inverse Predicates
+        inverse = AlphaConfig.INVERSE_PREDICATES.get(pred)
+        if inverse:
+            cur.execute("SELECT id FROM beliefs WHERE subject=? AND predicate=? AND object=?", (subj, inverse, obj))
+            rows = cur.fetchall()
+            for row in rows:
+                add_conflict(b_id, row['id'])
+
+        # 2. Symmetric Contradictions (preferred_over)
+        if pred == "preferred_over":
+            cur.execute("SELECT id FROM beliefs WHERE subject=? AND predicate=? AND object=?", (obj, pred, subj))
+            rows = cur.fetchall()
+            for row in rows:
+                add_conflict(b_id, row['id'])
+
+    def _increment_contradiction(self, b_id):
+        cur = self.conn.cursor()
+        cur.execute("UPDATE beliefs SET contradiction_score = contradiction_score + 1 WHERE id=?", (b_id,))
 
     def add_edge(self, source_id, target_id, edge_type, weight=0.5):
         """Saves a relationship between two beliefs to the database."""
@@ -99,13 +142,15 @@ class MemoryStore:
         """Adds a new goal if it doesn't already exist in pending state."""
         cur = self.conn.cursor()
         cur.execute("SELECT id FROM goals WHERE description = ? AND status = 'pending'", (description,))
-        if cur.fetchone():
-            return
+        row = cur.fetchone()
+        if row:
+            return row['id']
             
         g_id = str(uuid.uuid4())
         cur.execute("INSERT INTO goals (id, description, priority, status) VALUES (?, ?, ?, ?)",
                     (g_id, description, priority, 'pending'))
         self.conn.commit()
+        return g_id
 
     def get_next_goal(self):
         """Retrieves the highest priority pending goal."""
@@ -133,7 +178,8 @@ class MemoryStore:
             params.extend([p, p, p])
         
         # Optimization: Prioritize high-evidence beliefs so they aren't cut off by LIMIT
-        query = f"SELECT * FROM beliefs WHERE {' OR '.join(conditions)} ORDER BY evidence_score DESC LIMIT 50"
+        # Sort by Evidence -> Support (Connectivity) -> Usage. This ensures definitions bubbles up.
+        query = f"SELECT * FROM beliefs WHERE {' OR '.join(conditions)} ORDER BY evidence_score DESC, structural_support_score DESC, usage_count DESC LIMIT 20"
         cur = self.conn.cursor()
         cur.execute(query, params)
         return [dict(row) for row in cur.fetchall()]
@@ -183,6 +229,28 @@ class MemoryStore:
             
         # Delete the old node
         cur.execute("DELETE FROM beliefs WHERE id = ?", (merge_id,))
+        self.conn.commit()
+
+    def recompute_structural_support(self):
+        """Updates structural_support_score for all beliefs based on connectivity."""
+        cur = self.conn.cursor()
+        
+        # Fetch all edges to build graph in memory
+        cur.execute("SELECT source_id, target_id, type FROM edges")
+        edges = cur.fetchall()
+        
+        # Calculate in-degrees (weighted by usage/existence)
+        in_degrees = {}
+        for e in edges:
+            if e['type'] == 'contradicts': continue
+            target = e['target_id']
+            in_degrees[target] = in_degrees.get(target, 0) + 1
+            
+        # Reset and Update
+        cur.execute("UPDATE beliefs SET structural_support_score = 0")
+        if in_degrees:
+            updates = [(score, b_id) for b_id, score in in_degrees.items()]
+            cur.executemany("UPDATE beliefs SET structural_support_score = ? WHERE id = ?", updates)
         self.conn.commit()
 
     def get_all_beliefs(self):

@@ -14,10 +14,28 @@ class AlphaConfig:
     # System Limits
     MAX_LLM_CALLS = 2
     ACTIVATION_DECAY = 0.5
-    TOP_K_ACTIVATION = 5
+    TOP_K_ACTIVATION = 10
+    TOP_K_DEEP_THINK = 25
+    TOP_K_SYNTHESIZE = 10
     MIN_CONFIDENCE_FOR_CONTEXT = 0.6
     FORGET_RETENTION_DAYS = 3  # Days to keep low-evidence, unused beliefs
-    CONSOLIDATION_THRESHOLD = 10  # Trigger consolidation after learning this many new beliefs
+    CONSOLIDATION_THRESHOLD = 15  # Trigger consolidation after learning this many new beliefs
+
+    # Curiosity & Stability
+    CURIOSITY_THRESHOLD = 0.5
+    STABILITY_THRESHOLD = 0.3
+    LLM_BUDGET_WINDOW = 10
+    MAX_LLM_CALLS_IN_WINDOW = 20
+    RESEARCH_MAX_TIME_SECONDS = 60  # Max duration for a single research_topic call (prevents infinite rabbit holes)
+    MAX_CURIOSITY_GOALS_WINDOW = 2
+    CURIOSITY_COOLDOWN_SECONDS = 300
+    
+    INVERSE_PREDICATES = {
+        "is_a": "not_is_a",
+        "caused_by": "prevents",
+        "has": "not_has",
+        "likes": "dislikes"
+    }
 
     # A set of common English words to ignore during belief retrieval to reduce noise.
     STOP_WORDS = {
@@ -34,7 +52,19 @@ class AlphaConfig:
         'themselves', 'then', 'there', 'these', 'they', 'this', 'those',
         'through', 'to', 'too', 'under', 'until', 'up', 'very', 'was', 'we',
         'were', 'what', 'when', 'where', 'which', 'while', 'who', 'whom', 'why',
-        'will', 'with', 'you', 'your', 'yours', 'yourself', 'yourselves'
+        'will', 'with', 'you', 'your', 'yours', 'yourself', 'yourselves',
+        'tell', 'describe', 'explain', 'show', 'find', 'search',
+        'may', 'might', 'could', 'can', 'would', 'should', 'must',
+        'one', 'two', 'three', 'first', 'second', 'third',
+        'result', 'occur', 'caused', 'using', 'use', 'used', 'made', 'make'
+    }
+
+    # Common entity suffixes/types that cause noise if matched in isolation
+    # e.g. "Hanseatic League" matching "Champions League" just on "League"
+    COMMON_ENTITIES = {
+        'league', 'union', 'united', 'association', 'organization', 'group', 
+        'party', 'club', 'agency', 'council', 'committee', 'department', 
+        'ministry', 'system', 'network', 'service', 'force', 'army'
     }
 
     # Natural Language Configuration
