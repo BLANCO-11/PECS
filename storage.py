@@ -25,6 +25,7 @@ class MemoryStore:
                 structural_support_score REAL DEFAULT 0.0,
                 decay_rate REAL DEFAULT 0.1,
                 last_updated REAL,
+                created_at REAL,
                 usage_count INTEGER DEFAULT 0,
                 UNIQUE(subject, predicate, object)
             )
@@ -44,6 +45,11 @@ class MemoryStore:
             )
         """)
         
+        # Performance Indexes
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_beliefs_object ON beliefs(object)")
+        
         # Goals Table
         cur.execute("""
             CREATE TABLE IF NOT EXISTS goals (
@@ -53,6 +59,14 @@ class MemoryStore:
                 status TEXT
             )
         """)
+
+        # Migration: Add created_at if missing (for existing databases)
+        try:
+            cur.execute("SELECT created_at FROM beliefs LIMIT 1")
+        except sqlite3.OperationalError:
+            print("[System] Migrating DB: Adding 'created_at' to beliefs table...")
+            cur.execute("ALTER TABLE beliefs ADD COLUMN created_at REAL")
+            cur.execute("UPDATE beliefs SET created_at = last_updated")
         
         self.conn.commit()
 
@@ -83,9 +97,9 @@ class MemoryStore:
             # Insert new
             b_id = str(uuid.uuid4())
             cur.execute("""
-                INSERT INTO beliefs (id, type, subject, predicate, object, last_updated, evidence_score)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (b_id, b_type, subj, pred, obj, now, weight))
+                INSERT INTO beliefs (id, type, subject, predicate, object, last_updated, evidence_score, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (b_id, b_type, subj, pred, obj, now, weight, now))
             is_new = True
 
         # Contradiction Detection
@@ -137,6 +151,14 @@ class MemoryStore:
             VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO NOTHING
         """, (edge_id, source_id, target_id, edge_type, weight, now))
+
+    def is_research_goal_achieved(self, topic):
+        """Checks if a research goal for this topic has already been completed."""
+        cur = self.conn.cursor()
+        pattern_exact = f"Research {topic}"
+        pattern_sub = f"Research %: {topic}"
+        cur.execute("SELECT 1 FROM goals WHERE status = 'achieved' AND (description = ? OR description LIKE ?)", (pattern_exact, pattern_sub))
+        return cur.fetchone() is not None
 
     def add_goal(self, description, priority=1):
         """Adds a new goal if it doesn't already exist in pending state."""

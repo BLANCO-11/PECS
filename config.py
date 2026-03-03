@@ -18,8 +18,10 @@ class AlphaConfig:
     TOP_K_DEEP_THINK = 25
     TOP_K_SYNTHESIZE = 10
     MIN_CONFIDENCE_FOR_CONTEXT = 0.6
+    MIN_LLM_CONFIDENCE_TO_INGEST = 0.75 # New: Threshold for initial LLM extraction
     FORGET_RETENTION_DAYS = 3  # Days to keep low-evidence, unused beliefs
-    CONSOLIDATION_THRESHOLD = 15  # Trigger consolidation after learning this many new beliefs
+    CONSOLIDATION_THRESHOLD = 50  # Trigger consolidation after learning this many new beliefs
+    RESEARCH_EXISTING_KNOWLEDGE_THRESHOLD = 5 # Skip research if we have this many beliefs about the topic
 
     # Curiosity & Stability
     CURIOSITY_THRESHOLD = 0.5
@@ -28,7 +30,9 @@ class AlphaConfig:
     MAX_LLM_CALLS_IN_WINDOW = 20
     RESEARCH_MAX_TIME_SECONDS = 60  # Max duration for a single research_topic call (prevents infinite rabbit holes)
     MAX_CURIOSITY_GOALS_WINDOW = 2
-    CURIOSITY_COOLDOWN_SECONDS = 300
+    CURIOSITY_COOLDOWN_SECONDS = 60
+    MAX_NEWS_HEADLINES = 5
+    MAX_CHUNK_SIZE = 4000
     
     INVERSE_PREDICATES = {
         "is_a": "not_is_a",

@@ -21,12 +21,16 @@ class PECSCore:
         self.current_interaction_llm_calls = 0
         self.session_new_beliefs_count = 0
         
-    def learn(self, user_input: str, verbose: bool = False) -> List[Tuple]:
+    def learn(self, user_input: str, verbose: bool = False, focus_topic: str = None, prune: bool = True) -> List[Tuple]:
         """
         Ingests knowledge from input. Runs extraction and belief revision.
         Does NOT generate a response.
         """
-        print(f"\n--- Learning from: '{user_input}' ---")
+        # Clean and truncate input for logging
+        clean_input = ' '.join(user_input.split())
+        truncate_at = 70
+        truncated_input = (clean_input[:truncate_at] + '...') if len(clean_input) > truncate_at else clean_input
+        print(f"\n--- Learning from: '{truncated_input}' ---")
         
         # Always get context first to establish relationships for new beliefs
         raw_context = self._get_relevant_context(user_input)
@@ -42,14 +46,16 @@ class PECSCore:
         if not extracted_triples:
             print("Symbolic extraction ambiguous. Calling LLM...")
             self.current_interaction_llm_calls += 1
-            llm_result = self.llm.extract(user_input, context, verbose=verbose)
+            llm_result = self.llm.extract(user_input, context, verbose=verbose, focus_topic=focus_topic)
             
             extracted_triples = []
             for item in llm_result.get("proposed_beliefs", []):
                 s = item.get('subject')
                 p = item.get('predicate')
                 o = item.get('object')
-                if s and p and o:
+                confidence = item.get('confidence', 0.0)
+                if s and p and o and confidence >= AlphaConfig.MIN_LLM_CONFIDENCE_TO_INGEST:
+                    if verbose: print(f"  LLM proposed: ({s}, {p}, {o}) with confidence {confidence:.2f}")
                     extracted_triples.append((s, p, o))
             
             # Deduplicate to prevent LLM repetition loops
@@ -60,10 +66,19 @@ class PECSCore:
         else:
             print(f"Symbolic match: {extracted_triples}")
 
-        # 3. Belief Revision (Update Graph)
+        # 3. Validate extracted triples before revision
+        validated_triples = []
+        for s, p, o in extracted_triples:
+            if self._is_valid_triple(s, p, o, verbose=verbose):
+                validated_triples.append((str(s), str(p), str(o)))
+
+        if not validated_triples and extracted_triples:
+            print("  [WARN] All extracted triples were filtered out by validation.")
+
+        # 4. Belief Revision (Update Graph)
         newly_created_ids = []
         new_belief_content = {}
-        for subj, pred, obj in extracted_triples:
+        for subj, pred, obj in validated_triples:
             # Normalize
             subj, pred, obj = subj.lower(), pred.lower(), obj.lower()
             
@@ -89,7 +104,9 @@ class PECSCore:
                         self.memory.add_edge(source_id=context_belief['id'], target_id=new_id, edge_type='related_to', weight=0.5)
         
         self.memory.conn.commit()
-        self.memory.prune_graph() # Enforce bounds
+        
+        if prune:
+            self.memory.prune_graph() # Enforce bounds
         
         # Resting Period: Check if we need to consolidate (Prune & Merge)
         self.session_new_beliefs_count += len(newly_created_ids)
@@ -100,7 +117,7 @@ class PECSCore:
 
         return extracted_triples
 
-    def batch_learn(self, text: str, verbose: bool = False) -> List[Tuple]:
+    def batch_learn(self, text: str, verbose: bool = False, focus_topic: str = None) -> List[Tuple]:
         """
         Splits long text into chunks and learns from them sequentially.
         Efficient for ingesting news articles or documents.
@@ -118,9 +135,10 @@ class PECSCore:
             if not chunk: continue
             
             # Group chunks into blocks of ~500 chars for efficient LLM extraction
-            if current_len + len(chunk) > 500:
-                triples = self.learn(" ".join(current_batch), verbose)
-                all_triples.extend(triples)
+            if current_len + len(chunk) > 1000:
+                if current_batch:
+                    triples = self.learn(" ".join(current_batch), verbose, focus_topic=focus_topic, prune=False)
+                    all_triples.extend(triples)
                 current_batch = [chunk]
                 current_len = len(chunk)
             else:
@@ -129,9 +147,10 @@ class PECSCore:
         
         # Process remaining
         if current_batch:
-            triples = self.learn(" ".join(current_batch), verbose)
+            triples = self.learn(" ".join(current_batch), verbose, focus_topic=focus_topic, prune=False)
             all_triples.extend(triples)
             
+        self.memory.prune_graph() # Prune once at the end of the batch
         return all_triples
 
     def query(self, user_input: str, verbose: bool = False) -> str:
@@ -154,6 +173,7 @@ class PECSCore:
                 # Pick the most specific (longest) one
                 keywords.sort(key=len, reverse=True)
                 topic_to_research = keywords[0]
+            
                 print(f"[Self-Correction] I don't have information on '{topic_to_research}'. Researching now...")
                 self.research_topic(topic_to_research, verbose=verbose)
                 
@@ -201,25 +221,26 @@ class PECSCore:
             elif b['confidence'] > 0.75 and is_relevant:
                 matches.append(b)
 
-        if matches:
+        # Optimization: Use lightweight synthesis if we have matches AND we are NOT in deep think mode.
+        # If deep_think is True, we skip this to force the richer 'reason' path below.
+        if matches and not self.deep_think_mode:
             # Optimization: Template-based response (Zero Tokens)
             # If we have a direct match and a known predicate, construct sentence locally.
-            # Skip optimization if deep_think is requested to allow for richer synthesis.
-            if not self.deep_think_mode:
-                template_responses = []
-                for b in matches[:AlphaConfig.TOP_K_SYNTHESIZE]:
-                    pred_phrase = AlphaConfig.PREDICATE_MAP.get(b['predicate'])
-                    if pred_phrase:
-                        template_responses.append(f"{b['subject']} {pred_phrase} {b['object']}.")
-                
-                if template_responses:
-                    return " ".join(template_responses)
+            template_responses = []
+            for b in matches[:AlphaConfig.TOP_K_SYNTHESIZE]:
+                pred_phrase = AlphaConfig.PREDICATE_MAP.get(b['predicate'])
+                if pred_phrase:
+                    template_responses.append(f"{b['subject']} {pred_phrase} {b['object']}.")
+            
+            if template_responses:
+                return " ".join(template_responses)
 
-            # Select up to 3 .llm.synthesize(selected, verbose=verbose)
-            synth_limit = AlphaConfig.TOP_K_DEEP_THINK if self.deep_think_mode else AlphaConfig.TOP_K_SYNTHESIZE
-            selected = matches[:synth_limit]
+            # Use lightweight LLM to generate a natural sentence from the facts
+            selected = matches[:AlphaConfig.TOP_K_SYNTHESIZE]
             # Use lightweight LLM to generate a natural sentence from the facts
             response = self.llm.synthesize(user_input, selected, verbose=verbose)
+            if response:
+                return response
 
 
         # 6. LLM Reasoner (Fallback)
@@ -229,42 +250,57 @@ class PECSCore:
                 return "I don't have enough information in my memory to answer that."
 
             print("Deterministic logic insufficient. Calling LLM Reasoner...")
+            # Use a smarter model if deep_think is enabled
+            reasoning_model = "llama-3.3-70b-versatile" if self.deep_think_mode else "llama-3.1-8b-instant"
             self.current_interaction_llm_calls += 1
-            response = self.llm.reason(user_input, active_context, verbose=verbose)
+            response = self.llm.reason(user_input, active_context, verbose=verbose, model=reasoning_model)
 
-        print(f"RESPONSE: {response}")
         return response
 
-    def process_interaction(self, user_input: str, verbose: bool = False):
+    def process_interaction(self, user_input: str, verbose: bool = False, deep_think: bool = None):
         """
         Conversational wrapper: Decides whether to learn, then responds.
+        Can temporarily override deep_think_mode for a single interaction.
         """
-        self.current_interaction_llm_calls = 0 # Reset for this interaction
+        original_deep_think_mode = self.deep_think_mode
+        if deep_think is not None:
+            self.deep_think_mode = deep_think
+            if verbose:
+                print(f"[System] Deep Think mode temporarily set to {self.deep_think_mode}")
 
-        # Command: Explicit Research
-        # Allows user to say "Learn about football" or "Research quantum physics"
-        if user_input.lower().startswith(("learn about ", "research ")):
-            topic = re.sub(r"^(learn about|research)\s+", "", user_input, flags=re.IGNORECASE).strip()
-            self.research_topic(topic, verbose)
-            return f"I have finished researching '{topic}' and updated my memory."
+        try:
+            self.current_interaction_llm_calls = 0 # Reset for this interaction
 
-        # Optimization: If input is a question, skip extraction to save tokens
-        is_question = "?" in user_input or user_input.lower().strip().startswith(
-            ("what", "who", "where", "when", "why", "how", "tell", "describe", "explain", "show")
-        )
-        
-        if not is_question:
-            self.learn(user_input, verbose)
-        else:
-            print(f"\n--- Processing: '{user_input}' (Read-Only) ---")
+            # Command: Explicit Research
+            # Allows user to say "Learn about football" or "Research quantum physics"
+            if user_input.lower().startswith(("learn about ", "research ", "force research ", "resarch ", "wiki ")):
+                is_force = user_input.lower().startswith("force research ")
+                is_wiki = user_input.lower().startswith("wiki ")
+                topic = re.sub(r"^(force research|learn about|research|resarch|wiki)\s+", "", user_input, flags=re.IGNORECASE).strip()
+                source = "wiki" if is_wiki else "web"
+                self.research_topic(topic, verbose, force=is_force, source=source)
+                return f"I have finished researching '{topic}' via {source} and updated my memory."
+
+            # Optimization: If input is a question, skip extraction to save tokens
+            is_question = "?" in user_input or user_input.lower().strip().startswith(
+                ("what", "who", "where", "when", "why", "how", "tell", "describe", "explain", "show")
+            )
             
-        response = self.query(user_input, verbose)
+            if not is_question:
+                self.learn(user_input, verbose)
+            else:
+                print(f"\n--- Processing: '{user_input}' (Read-Only) ---")
+                
+            response = self.query(user_input, verbose)
 
-        # Record usage and check curiosity
-        self.llm_call_history.append(self.current_interaction_llm_calls)
-        self.evaluate_curiosity_trigger(verbose)
+            # Record usage and check curiosity
+            self.llm_call_history.append(self.current_interaction_llm_calls)
+            self.evaluate_curiosity_trigger(verbose)
 
-        return response
+            return response
+        finally:
+            # Restore original deep think mode
+            self.deep_think_mode = original_deep_think_mode
 
     def consolidate(self):
         """
@@ -295,7 +331,7 @@ class PECSCore:
         # 6. Check Curiosity
         self.evaluate_curiosity_trigger()
 
-    def research_topic(self, topic: str, depth: int = 0, verbose: bool = False, root_topic: str = None, is_autonomous: bool = False, start_time: float = None):
+    def research_topic(self, topic: str, depth: int = 0, verbose: bool = False, root_topic: str = None, is_autonomous: bool = False, start_time: float = None, force: bool = False, source: str = "web"):
         """
         Actively searches Wikipedia for a topic and learns from the summary.
         Recursively explores interesting sub-topics found during research.
@@ -309,6 +345,14 @@ class PECSCore:
         if start_time is None:
             start_time = time.time()
 
+        # Check Knowledge Base (Deduplication)
+        if not force:
+            # Check if we have already completed a goal for this topic
+            if self.memory.is_research_goal_achieved(topic):
+                if verbose: 
+                    print(f"[Research] Skipping '{topic}': Goal already achieved in the past.")
+                return
+
         # Check Time Budget
         elapsed = time.time() - start_time
         if elapsed > AlphaConfig.RESEARCH_MAX_TIME_SECONDS:
@@ -320,21 +364,59 @@ class PECSCore:
         if depth > 2: # Limit recursion to prevent infinite rabbit holes
             return
             
-        print(f"\n[Research] Searching Wikipedia for: '{topic}'...")
         import tools
         
-        url, summary = tools.search_wikipedia(topic)
-        
-        if not url or not summary:
-            print("[Research] No Wikipedia results found.")
-            return
+        learned_triples = []
+        learned_something = False
 
-        print(f"[Research] Found: {url}")
-        print(f"[Research] Reading summary ({len(summary)} chars)...")
-        
-        # Limit extraction to 2000 chars (Wiki summaries are usually concise, but just in case)
-        snippet = summary[:2000] 
-        learned_triples = self.batch_learn(snippet, verbose=verbose)
+        # 1. Web Search (Default)
+        if source == "web":
+            print(f"\n[Research] Searching Web for: '{topic}'...")
+            max_res = 15 if self.deep_think_mode else 5
+            results = tools.search_web(topic, max_results=max_res)
+            
+            if results:
+                print(f"[Research] Found {len(results)} web results.")
+                for res in results:
+                    if not self.llm.check_search_result_relevance(topic, res['title'], res.get('summary') or ""):
+                        if verbose: print(f"  [Research] Skipping irrelevant: {res['title']}")
+                        continue
+
+                    print(f"  - Reading: {res['title']}")
+                    
+                    # Fetch full page content for better learning
+                    page_text = tools.fetch_webpage_text(res['link'])
+                    if len(page_text) > 500:
+                        content = f"Source: {res['title']}\nContent: {page_text}"
+                    else:
+                        content = f"{res['title']}: {res['summary']}"
+                        
+                    focus = root_topic if root_topic else topic
+                    triples = self.batch_learn(content, verbose=verbose, focus_topic=focus)
+                    learned_triples.extend(triples)
+                learned_something = True
+            else:
+                print("[Research] No web results found. Falling back to Wikipedia.")
+                source = "wiki" # Fallback
+
+        # 2. Wikipedia Search (Fallback or Explicit)
+        if source == "wiki":
+            print(f"\n[Research] Searching Wikipedia for: '{topic}'...")
+            url, summary = tools.search_wikipedia(topic)
+            
+            if url and summary:
+                print(f"[Research] Found: {url}")
+                print(f"[Research] Reading summary ({len(summary)} chars)...")
+                snippet = summary[:AlphaConfig.MAX_CHUNK_SIZE] 
+                focus = root_topic if root_topic else topic
+                triples = self.batch_learn(snippet, verbose=verbose, focus_topic=focus)
+                learned_triples.extend(triples)
+                learned_something = True
+            else:
+                print("[Research] No Wikipedia results found.")
+
+        if not learned_something:
+            return
         
         # --- Structural Research (Autonomy) ---
         # If this is the main topic (depth 0), we plan a structured deep dive.
@@ -346,13 +428,19 @@ class PECSCore:
             if sub_topics:
                 print(f"[Research] Plan created: {sub_topics}")
                 for sub in sub_topics:
+                    # Ensure the planned sub-topic is relevant to the original query
+                    if not self.llm.check_relevance(root_topic, sub):
+                        if verbose: 
+                            print(f"[Research] Pruning irrelevant sub-topic from plan: '{sub}'")
+                        continue
+
                     # Utilize Goal Creation to track what we are going to learn
                     goal_desc = f"Research {topic}: {sub}"
                     g_id = self.memory.add_goal(goal_desc, priority=10) # High priority to do it now
                     
                     # Execute immediately to fulfill the user's request in this session
                     print(f"[Research] Executing sub-goal: {sub}")
-                    self.research_topic(sub, depth=depth + 1, verbose=verbose, root_topic=root_topic, is_autonomous=is_autonomous, start_time=start_time)
+                    self.research_topic(sub, depth=depth + 1, verbose=verbose, root_topic=root_topic, is_autonomous=is_autonomous, start_time=start_time, source=source)
                     
                     # Mark done
                     if g_id: self.memory.complete_goal(g_id)
@@ -360,6 +448,11 @@ class PECSCore:
                 return # Plan completed
 
         # --- Serendipitous Curiosity ---
+        # If we are in focused mode (not autonomous) and we are deep in recursion (depth > 0),
+        # we assume the plan covers what is needed. We stop here to prevent drift.
+        if not is_autonomous and depth > 0:
+            return
+
         # If we are exploring a sub-topic or no plan was made, follow interesting sparks.
         sparks = self._identify_curiosity_sparks(learned_triples)
         for spark in list(sparks)[:2]: # Limit to top 2 sparks
@@ -373,9 +466,67 @@ class PECSCore:
                 # Only dive if strictly relevant to the root topic.
                 if root_topic and self.llm.check_relevance(root_topic, spark):
                     print(f"[Research] Focused: '{spark}' is relevant to '{root_topic}'. Diving deeper...")
-                    self.research_topic(spark, depth=depth + 1, verbose=verbose, root_topic=root_topic, is_autonomous=False, start_time=start_time)
+                    self.research_topic(spark, depth=depth + 1, verbose=verbose, root_topic=root_topic, is_autonomous=False, start_time=start_time, source=source)
                 else:
-                    if verbose: print(f"[Research] Focused: Ignoring '{spark}' as it is not relevant to '{root_topic}'.")
+                    if verbose: print(f"[Research] Focused: Ignoring '{spark}' (tangential).")
+
+    def read_news(self, verbose: bool = False):
+        """
+        Fetches latest news, learns from it, and performs deep research on interesting/unknown topics.
+        """
+        try:
+            import tools
+        except ImportError:
+            print("[System] Tools module not found.")
+            return
+
+        print("\n--- 📰 Scanning Global News Feeds ---")
+        news_items = tools.fetch_rss_news()
+        
+        if not news_items:
+            print("[News] No items found or connection failed.")
+            return
+
+        # Limit processing to avoid overload
+        process_count = min(len(news_items), AlphaConfig.MAX_NEWS_HEADLINES)
+        print(f"[News] Retrieved {len(news_items)} headlines. Processing top {process_count}...")
+        
+        research_limit = 2
+        research_count = 0
+        
+        for i, item in enumerate(news_items[:process_count]):
+            headline = item['title']
+            summary = item.get('summary', '')
+            content = f"{headline}. {summary}"
+            
+            print(f"\n[{i+1}/{len(news_items)}] Learning: {headline}")
+            
+            # 1. Fast Learn (Surface)
+            triples = self.learn(content, verbose=verbose, prune=False)
+            
+            # 2. Check Curiosity
+            sparks = self._identify_curiosity_sparks(triples)
+            
+            if sparks and research_count < research_limit:
+                research_count += 1
+                # Prioritize the spark that looks most like a specific entity (Capitalized, longer)
+                target = max(sparks, key=len)
+                
+                print(f"[News] 💡 Curiosity triggered: I don't know much about '{target}'.")
+                print(f"[News] Launching investigation into '{target}'...")
+                
+                # Trigger research
+                self.research_topic(target, depth=0, verbose=verbose, source="web")
+            elif sparks:
+                target = max(sparks, key=len)
+                print(f"[News] 💡 Curiosity triggered for '{target}', but research limit reached. Adding as goal.")
+                self.memory.add_goal(f"Research {target}", priority=3)
+            else:
+                if verbose: print("[News] Concepts appear familiar. Moving on.")
+        
+        # Cleanup after batch
+        self.memory.prune_graph()
+        print("\n[News] Session complete.")
 
     def autonomous_discovery(self, verbose: bool = False, max_cycles: int = None):
         """
@@ -479,6 +630,32 @@ class PECSCore:
             if len(related) <= 1:
                 unknown_subjects.add(subj)
         return unknown_subjects
+
+    def _is_valid_triple(self, s: str, p: str, o: str, verbose: bool = False) -> bool:
+        """Performs basic sanity checks on an extracted triple."""
+        # Check for empty parts
+        if not all((s, p, o)):
+            if verbose: print(f"  [INVALID] Triple part is empty: ({s}, {p}, {o})")
+            return False
+
+        # Convert to string now that we know they are not None/empty/0, to prevent TypeErrors.
+        s, p, o = str(s), str(p), str(o)
+
+        # Check for excessive length (could be a sign of poor extraction)
+        # Assumes AlphaConfig.MAX_TRIPLE_PART_LENGTH exists
+        max_len = getattr(AlphaConfig, 'MAX_TRIPLE_PART_LENGTH', 100)
+        if any(len(part) > max_len for part in [s, p, o]):
+            if verbose: print(f"  [INVALID] Triple part too long: ({s}, {p}, {o})")
+            return False
+
+        # Check if subject or object are just stop words (after lowercasing)
+        # Assumes AlphaConfig.STOP_WORDS exists
+        stop_words = getattr(AlphaConfig, 'STOP_WORDS', set())
+        if s.lower() in stop_words or o.lower() in stop_words:
+            if verbose: print(f"  [INVALID] Subject or object is a stopword: ({s}, {p}, {o})")
+            return False
+
+        return True
 
     # --- Curiosity Engine ---
 

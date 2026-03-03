@@ -56,9 +56,10 @@ class ActivationEngine:
             score = 0
             # Simple keyword matching
             content = f"{node['subject']} {node['predicate']} {node['object']}".lower()
+            content_tokens = set(content.split())
             for token in clean_tokens:
                 # Exact match preferred, partial match allowed
-                if token in content.split():
+                if token in content_tokens:
                     score += 1.0
                 elif token in content:
                     score += 0.5

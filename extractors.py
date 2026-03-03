@@ -36,7 +36,7 @@ class LLMExtractor:
     def __init__(self, api_key):
         self.client = Groq(api_key=api_key)
 
-    def extract(self, text: str, context_beliefs: List[Dict], verbose: bool = False) -> Dict:
+    def extract(self, text: str, context_beliefs: List[Dict], verbose: bool = False, focus_topic: str = None) -> Dict:
         """
         Fallback extraction using Groq.
         """
@@ -46,6 +46,14 @@ class LLMExtractor:
         if verbose:
             print(f"--- [DEBUG] Sending to LLM (Extract Context) ---\n{context_str}\n------------------------------------------------")
         
+        focus_instruction = ""
+        if focus_topic:
+            focus_instruction = f"""
+        IMPORTANT: The user is specifically interested in '{focus_topic}'. 
+        - STRICTLY FILTER: Only extract facts that are directly relevant to '{focus_topic}'.
+        - EXCLUSION: If the text contains information about other aspects (e.g. 'playing career' when focus is 'manager'), DO NOT extract them.
+        - CONTEXT: Only include context if it explains '{focus_topic}'."""
+
         prompt = f"""
         Analyze the User Input and extract structured knowledge triples (Subject, Predicate, Object).
         
@@ -62,6 +70,7 @@ class LLMExtractor:
            - Break complex sentences into multiple simple triples.
            - Ensure subjects and objects are standalone entities.
         
+        {focus_instruction}
         Current Context:
         {context_str}
         
@@ -70,7 +79,7 @@ class LLMExtractor:
         Return JSON ONLY. Schema:
         {{
           "proposed_beliefs": [
-            {{"subject": "str", "predicate": "str", "object": "str", "type": "fact|preference"}}
+            {{"subject": "str", "predicate": "str", "object": "str", "confidence": float}}
           ]
         }}
         """
@@ -91,7 +100,7 @@ class LLMExtractor:
             print(f"LLM Error: {e}")
             return {"proposed_beliefs": []}
 
-    def reason(self, text: str, active_beliefs: List[Dict], verbose: bool = False) -> str:
+    def reason(self, text: str, active_beliefs: List[Dict], verbose: bool = False, model: str = "llama-3.1-8b-instant") -> str:
         """
         High-level reasoning when deterministic logic fails.
         """
@@ -120,7 +129,7 @@ class LLMExtractor:
         completion = self.client.chat.completions.create(
             messages=[{"role": "system", "content": "You are a helpful assistant grounded in provided facts."},
                       {"role": "user", "content": prompt}],
-            model="llama-3.1-8b-instant",
+            model=model,
             temperature=0.1
         )
         if verbose and completion.usage:
@@ -175,8 +184,10 @@ class LLMExtractor:
         Beliefs:
         {json.dumps(simple_list, indent=2)}
         
-        Return JSON list of pairs to merge:
-        [ {{"keep_id": "...", "merge_id": "..."}} ]
+        Return a JSON object with a "merges" key containing a list of pairs:
+        {{
+            "merges": [ {{"keep_id": "...", "merge_id": "..."}} ]
+        }}
         """
         
         try:
@@ -187,9 +198,15 @@ class LLMExtractor:
                 response_format={"type": "json_object"}
             )
             result = json.loads(completion.choices[0].message.content)
+            
+            candidates = []
             if isinstance(result, list):
-                return result
-            return result.get("pairs", [])
+                candidates = result
+            elif isinstance(result, dict):
+                candidates = result.get("merges", result.get("pairs", []))
+
+            # Validate keys to prevent KeyErrors downstream
+            return [m for m in candidates if isinstance(m, dict) and "keep_id" in m and "merge_id" in m]
         except Exception as e:
             print(f"Merge Error: {e}")
             return []
@@ -200,20 +217,32 @@ class LLMExtractor:
         """
         prompt = f"""
         I need to research '{topic}' thoroughly.
-        Identify 3 to 5 distinct, specific sub-topics or aspects that are essential to understanding '{topic}'.
-        Focus on aspects like History, Rules, Key Figures, Mechanics, or Impact.
+        Identify 3 to 5 distinct sub-topics or related entities that are essential to understanding '{topic}'.
+        
+        CRITICAL GUIDELINES:
+        1. **Relevance**: Sub-topics must be DIRECTLY related to '{topic}'. Avoid tangential, speculative, or minor associations.
+        2. **Significance**: Focus on major entities, key events, or core concepts.
+        3. **Searchability**: Use simple, standard names likely to have their own encyclopedia page.
+        4. **Context**: If the topic specifies a role (e.g., "as a manager"), ONLY include sub-topics relevant to that specific role.
+        
+        Do NOT use sentences, complex phrases, or "Impact of..." titles. Do NOT hallucinate connections.
+        
+        Example:
+        Topic: "Zinedine Zidane as a manager"
+        Sub-topics: ["Real Madrid", "UEFA Champions League", "Florentino Pérez", "La Liga"]
         
         Return JSON ONLY in this format:
         {{
-            "sub_topics": ["{topic} history", "{topic} rules", ...]
+            "sub_topics": ["Entity 1", "Entity 2", ...]
         }}
         """
         
         try:
             completion = self.client.chat.completions.create(
-                messages=[{"role": "system", "content": "You are a research planner."},
+                messages=[{"role": "system", "content": "You are a research planner. You output Wikipedia-friendly search terms."},
                           {"role": "user", "content": prompt}],
                 model="llama-3.1-8b-instant",
+                temperature=0.0,
                 response_format={"type": "json_object"}
             )
             result = json.loads(completion.choices[0].message.content)
@@ -245,3 +274,27 @@ class LLMExtractor:
             return "yes" in response
         except Exception:
             return False
+
+    def check_search_result_relevance(self, topic: str, title: str, snippet: str) -> bool:
+        """
+        Determines if a search result is relevant to the research topic.
+        """
+        prompt = f"""
+        I am researching: "{topic}"
+        
+        Search Result:
+        Title: "{title}"
+        Snippet: "{snippet}"
+        
+        Is this result relevant to the topic? Answer YES or NO.
+        """
+        try:
+            completion = self.client.chat.completions.create(
+                messages=[{"role": "user", "content": prompt}],
+                model="llama-3.1-8b-instant",
+                max_tokens=5
+            )
+            response = completion.choices[0].message.content.strip().lower()
+            return "yes" in response
+        except Exception:
+            return True

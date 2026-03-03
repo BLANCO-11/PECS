@@ -67,3 +67,72 @@ def search_wikipedia(topic: str):
     except Exception as e:
         print(f"Error searching Wikipedia: {e}")
         return None, None
+
+def search_web(query: str, max_results: int = 5):
+    """
+    Searches the web using DuckDuckGo and returns the top results.
+    """
+    results = []
+    try:
+        from ddgs import DDGS
+        with DDGS(timeout=10) as ddgs:
+            for r in ddgs.text(query, max_results=max_results):
+                results.append({
+                    'title': r.get('title'),
+                    'link': r.get('href'),
+                    'summary': r.get('body')
+                })
+        return results
+    except Exception as e:
+        print(f"[Tools] DuckDuckGo error: {e}")
+        return []
+
+def fetch_webpage_text(url: str) -> str:
+    """
+    Fetches the main text content from a webpage URL using Readability (if available) or BeautifulSoup.
+    """
+    try:
+        from bs4 import BeautifulSoup, GuessedAtParserWarning
+        import warnings
+        # Suppress the parser warning since we are okay with the default
+        warnings.filterwarnings("ignore", category=GuessedAtParserWarning)
+
+        req = urllib.request.Request(
+            url,
+            data=None,
+            # A realistic user agent is important for many sites
+            headers={'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+        )
+        with urllib.request.urlopen(req, timeout=15) as response:
+            if 'text/html' not in response.getheader('Content-Type', ''):
+                return ""
+            
+            html_content = response.read()
+            
+            # Try readability first
+            try:
+                from readability import Document
+                doc = Document(html_content)
+                summary_html = doc.summary()
+                soup = BeautifulSoup(summary_html, 'html.parser')
+                text = soup.get_text(separator='\n', strip=True)
+                return text
+            except ImportError:
+                pass
+            except Exception:
+                pass # Fallback to raw BS4
+
+            soup = BeautifulSoup(html_content, 'html.parser')
+
+            for tag in soup(['nav', 'header', 'footer', 'aside', 'script', 'style', 'form']):
+                tag.decompose()
+
+            text = soup.get_text(separator='\n', strip=True)
+            lines = (line.strip() for line in text.splitlines())
+            non_empty_lines = [line for line in lines if line]
+            
+            return "\n".join(non_empty_lines)
+
+    except Exception as e:
+        print(f"Error fetching webpage content for {url}: {e}")
+        return ""
