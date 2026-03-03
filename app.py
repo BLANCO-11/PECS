@@ -70,16 +70,17 @@ if __name__ == "__main__":
     # core.autonomous_discovery()
     
     # Mode 5: Focused Research (Self-Learning but sticks to a topic)
-    # core.research_topic("research Cristiano ROnaldo", verbose=True)
+    # core.research_topic("research Quantum Physics", verbose=True)
     
     # You can then query what it learned after a learning session:
     # Use deep_think=True for a more comprehensive, synthesized answer at the cost of more tokens.
-    # response = core.process_interaction("Tell me about Tiki Taka in football")
+    # response = core.process_interaction("Tell me about caste system in india", verbose=True, deep_think=True)
     # print(response)
     
     # core.read_news()
 
     # This is basically sleep equivalent for this sytem, cleans up neurons/nodes that are not relevant
     # core.consolidate()
+    
 
     core.close()

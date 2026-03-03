@@ -56,7 +56,9 @@ class MemoryStore:
                 id TEXT PRIMARY KEY,
                 description TEXT,
                 priority INTEGER,
-                status TEXT
+                status TEXT,
+                parent_id TEXT,
+                FOREIGN KEY(parent_id) REFERENCES goals(id)
             )
         """)
 
@@ -67,8 +69,34 @@ class MemoryStore:
             print("[System] Migrating DB: Adding 'created_at' to beliefs table...")
             cur.execute("ALTER TABLE beliefs ADD COLUMN created_at REAL")
             cur.execute("UPDATE beliefs SET created_at = last_updated")
+
+        # Migration: Add parent_id to goals if missing
+        try:
+            cur.execute("SELECT parent_id FROM goals LIMIT 1")
+        except sqlite3.OperationalError:
+            print("[System] Migrating DB: Adding 'parent_id' to goals table...")
+            cur.execute("ALTER TABLE goals ADD COLUMN parent_id TEXT")
+        
+        # FTS5 Virtual Table for fast text search
+        # We store the UUID 'id' as an unindexed column to map back to the main table
+        cur.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS beliefs_fts 
+            USING fts5(id UNINDEXED, subject, predicate, object)
+        """)
+
+        # Sync check: If FTS is empty but beliefs exist, populate it (Migration)
+        self._sync_fts_if_needed()
         
         self.conn.commit()
+
+    def _sync_fts_if_needed(self):
+        cur = self.conn.cursor()
+        cur.execute("SELECT count(*) FROM beliefs_fts")
+        if cur.fetchone()[0] == 0:
+            cur.execute("SELECT count(*) FROM beliefs")
+            if cur.fetchone()[0] > 0:
+                print("[System] Migrating knowledge to FTS5 index...")
+                cur.execute("INSERT INTO beliefs_fts (id, subject, predicate, object) SELECT id, subject, predicate, object FROM beliefs")
 
     def add_belief(self, subj, pred, obj, b_type="fact", weight=1.0):
         """Upsert logic: Update evidence if exists, Insert if new."""
@@ -100,6 +128,9 @@ class MemoryStore:
                 INSERT INTO beliefs (id, type, subject, predicate, object, last_updated, evidence_score, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """, (b_id, b_type, subj, pred, obj, now, weight, now))
+            
+            # Update FTS Index
+            cur.execute("INSERT INTO beliefs_fts (id, subject, predicate, object) VALUES (?, ?, ?, ?)", (b_id, subj, pred, obj))
             is_new = True
 
         # Contradiction Detection
@@ -160,7 +191,7 @@ class MemoryStore:
         cur.execute("SELECT 1 FROM goals WHERE status = 'achieved' AND (description = ? OR description LIKE ?)", (pattern_exact, pattern_sub))
         return cur.fetchone() is not None
 
-    def add_goal(self, description, priority=1):
+    def add_goal(self, description, priority=1, parent_id=None):
         """Adds a new goal if it doesn't already exist in pending state."""
         cur = self.conn.cursor()
         cur.execute("SELECT id FROM goals WHERE description = ? AND status = 'pending'", (description,))
@@ -169,8 +200,8 @@ class MemoryStore:
             return row['id']
             
         g_id = str(uuid.uuid4())
-        cur.execute("INSERT INTO goals (id, description, priority, status) VALUES (?, ?, ?, ?)",
-                    (g_id, description, priority, 'pending'))
+        cur.execute("INSERT INTO goals (id, description, priority, status, parent_id) VALUES (?, ?, ?, ?, ?)",
+                    (g_id, description, priority, 'pending', parent_id))
         self.conn.commit()
         return g_id
 
@@ -187,23 +218,26 @@ class MemoryStore:
         cur.execute("UPDATE goals SET status = 'achieved' WHERE id = ?", (goal_id,))
         self.conn.commit()
 
-    def search_beliefs(self, tokens: list):
+    def search_beliefs(self, tokens: list, limit: int = 50):
         """Finds beliefs containing any of the tokens (SQL optimized)."""
         if not tokens: return []
-        # Simple LIKE query for each token against subject/predicate/object
-        # Note: In production, FTS5 (Full Text Search) would be better.
-        conditions = []
-        params = []
-        for t in tokens:
-            conditions.append("(subject LIKE ? OR predicate LIKE ? OR object LIKE ?)")
-            p = f"%{t}%"
-            params.extend([p, p, p])
         
-        # Optimization: Prioritize high-evidence beliefs so they aren't cut off by LIMIT
-        # Sort by Evidence -> Support (Connectivity) -> Usage. This ensures definitions bubbles up.
-        query = f"SELECT * FROM beliefs WHERE {' OR '.join(conditions)} ORDER BY evidence_score DESC, structural_support_score DESC, usage_count DESC LIMIT 20"
+        # FTS5 Search: Much faster O(log N) compared to LIKE O(N)
+        # Construct query: "token1 OR token2 OR token3"
+        fts_query = " OR ".join(f'"{t}"' for t in tokens if t.isalnum())
+        if not fts_query: return []
+
         cur = self.conn.cursor()
-        cur.execute(query, params)
+        # We join with the main table to get the full belief data and sort by quality
+        sql = f"""
+            SELECT b.* 
+            FROM beliefs_fts f 
+            JOIN beliefs b ON f.id = b.id 
+            WHERE beliefs_fts MATCH ? 
+            ORDER BY b.evidence_score DESC, b.structural_support_score DESC 
+            LIMIT ?
+        """
+        cur.execute(sql, (fts_query, limit))
         return [dict(row) for row in cur.fetchall()]
 
     def get_subgraph(self, seed_ids: list):
@@ -251,6 +285,9 @@ class MemoryStore:
             
         # Delete the old node
         cur.execute("DELETE FROM beliefs WHERE id = ?", (merge_id,))
+        # Delete from FTS
+        cur.execute("DELETE FROM beliefs_fts WHERE id = ?", (merge_id,))
+        
         self.conn.commit()
 
     def recompute_structural_support(self):
@@ -280,6 +317,26 @@ class MemoryStore:
         cur.execute("SELECT * FROM beliefs")
         return [dict(row) for row in cur.fetchall()]
 
+    def get_beliefs(self, sort_by='last_accessed', limit=100):
+        """Retrieves a subset of beliefs sorted by a specific criteria."""
+        cur = self.conn.cursor()
+        if sort_by == 'last_accessed':
+            order = "last_updated DESC"
+        elif sort_by == 'evidence':
+            order = "evidence_score DESC"
+        else:
+            order = "last_updated DESC"
+            
+        cur.execute(f"SELECT * FROM beliefs ORDER BY {order} LIMIT ?", (limit,))
+        return [dict(row) for row in cur.fetchall()]
+
+    def apply_decay(self):
+        """Decays the evidence score of all beliefs."""
+        factor = 1.0 - AlphaConfig.GAMMA
+        cur = self.conn.cursor()
+        cur.execute("UPDATE beliefs SET evidence_score = evidence_score * ?", (factor,))
+        self.conn.commit()
+
     def get_edges(self):
         cur = self.conn.cursor()
         cur.execute("SELECT * FROM edges")
@@ -287,46 +344,100 @@ class MemoryStore:
 
     def forget_weak_beliefs(self):
         """
-        Removes beliefs that have decayed below a useful threshold.
-        Simulates long-term forgetting of trivial/unused facts.
+        Removes beliefs that have decayed below a useful threshold or are highly contradicted.
+        Simulates long-term forgetting of trivial/unused facts and their associated edges.
         """
         cur = self.conn.cursor()
-        # Policy: Forget facts that have default evidence (1.0), 
-        # haven't been used much (< 3 times), and are older than retention period.
         cutoff_time = time.time() - (AlphaConfig.FORGET_RETENTION_DAYS * 24 * 60 * 60)
         
+        # Get IDs of all beliefs to be deleted from both conditions
         cur.execute("""
-            DELETE FROM beliefs 
-            WHERE evidence_score <= 1.0 
-            AND usage_count < 3 
-            AND last_updated < ?
+            SELECT id FROM beliefs
+            WHERE (evidence_score <= 1.0 AND usage_count < 3 AND last_updated < ?)
+            OR (contradiction_score > evidence_score)
         """, (cutoff_time,))
+        ids_to_delete = [row['id'] for row in cur.fetchall()]
         
-        # Also forget highly contradicted beliefs regardless of age
-        cur.execute("""
-            DELETE FROM beliefs 
-            WHERE contradiction_score > evidence_score
-        """)
+        if not ids_to_delete:
+            return
+
+        # Batch deletes to avoid "too many SQL variables" error.
+        # Using 450 because the edge deletion uses the list twice. 450*2=900, safely under the 999 limit.
+        batch_size = 450
+        for i in range(0, len(ids_to_delete), batch_size):
+            batch = ids_to_delete[i:i + batch_size]
+            placeholders = ','.join('?' for _ in batch)
+
+            # 1. Delete associated edges pointing to or from the deleted beliefs
+            cur.execute(f"DELETE FROM edges WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders})", batch + batch)
+
+            # 2. Delete from FTS table
+            cur.execute(f"DELETE FROM beliefs_fts WHERE id IN ({placeholders})", batch)
+
+            # 3. Delete the beliefs themselves
+            cur.execute(f"DELETE FROM beliefs WHERE id IN ({placeholders})", batch)
+
         self.conn.commit()
 
     def prune_graph(self):
-        """Removes lowest stability beliefs if over limit."""
+        """Removes lowest stability beliefs and their edges if over limit."""
         cur = self.conn.cursor()
         cur.execute("SELECT COUNT(*) as count FROM beliefs")
         count = cur.fetchone()['count']
         
         if count > AlphaConfig.MAX_BELIEFS:
-            # Optimized Pruning:
-            # Prioritize removing contradicted beliefs (low net score), then low usage, then old.
-            # Sort ASC so the "worst" beliefs are at the top to be deleted.
-            cur.execute("""
-                DELETE FROM beliefs 
-                WHERE id IN (
-                    SELECT id FROM beliefs 
-                    ORDER BY (evidence_score - contradiction_score) ASC, usage_count ASC, last_updated ASC 
-                    LIMIT ?
-                )
-            """, (count - AlphaConfig.MAX_BELIEFS,))
+            limit = count - AlphaConfig.MAX_BELIEFS
+            cur.execute(f"SELECT id FROM beliefs ORDER BY (evidence_score - contradiction_score) ASC, usage_count ASC, last_updated ASC LIMIT {limit}")
+            ids_to_delete = [row['id'] for row in cur.fetchall()]
+
+            if ids_to_delete:
+                # Batch deletes to avoid "too many SQL variables" error.
+                batch_size = 450 # Using 450 because we use the list twice for edges.
+                for i in range(0, len(ids_to_delete), batch_size):
+                    batch = ids_to_delete[i:i + batch_size]
+                    placeholders = ','.join('?' for _ in batch)
+                    # 1. Delete associated edges
+                    cur.execute(f"DELETE FROM edges WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders})", batch + batch)
+                    # 2. Delete from FTS
+                    cur.execute(f"DELETE FROM beliefs_fts WHERE id IN ({placeholders})", batch)
+                    # 3. Delete beliefs
+                    cur.execute(f"DELETE FROM beliefs WHERE id IN ({placeholders})", batch)
+                
+            self.conn.commit()
+
+    def clean_orphaned_edges(self):
+        """
+        Finds and removes edges that point to non-existent beliefs.
+        This is a data integrity maintenance function to clean up corruption
+        from previous versions or unclean shutdowns.
+        """
+        cur = self.conn.cursor()
+        
+        # 1. Get all valid belief IDs into a fast lookup set
+        cur.execute("SELECT id FROM beliefs")
+        valid_belief_ids = {row['id'] for row in cur.fetchall()}
+        
+        if not valid_belief_ids:
+            # If there are no beliefs, there should be no edges.
+            cur.execute("DELETE FROM edges")
+            self.conn.commit()
+            return
+
+        # 2. Find all edge IDs that are invalid
+        cur.execute("SELECT id, source_id, target_id FROM edges")
+        orphaned_edge_ids = [
+            edge['id'] for edge in cur.fetchall() 
+            if edge['source_id'] not in valid_belief_ids or edge['target_id'] not in valid_belief_ids
+        ]
+        
+        if orphaned_edge_ids:
+            print(f"[System] Data Integrity: Found and removed {len(orphaned_edge_ids)} orphaned edge(s).")
+            # Batch delete to avoid "too many SQL variables" error
+            batch_size = 900 # SQLite's default variable limit is 999
+            for i in range(0, len(orphaned_edge_ids), batch_size):
+                batch = orphaned_edge_ids[i:i + batch_size]
+                placeholders = ','.join('?' for _ in batch)
+                cur.execute(f"DELETE FROM edges WHERE id IN ({placeholders})", batch)
             self.conn.commit()
 
     def close(self):

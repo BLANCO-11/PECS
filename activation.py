@@ -9,7 +9,7 @@ class ActivationEngine:
     def __init__(self, store: MemoryStore):
         self.store = store
 
-    def get_activated_beliefs(self, input_tokens: List[str]) -> List[Dict]:
+    def get_activated_beliefs(self, input_tokens: List[str], limit: int = AlphaConfig.TOP_K_ACTIVATION) -> List[Dict]:
         """
         1. Find seed nodes based on input tokens.
         2. Spread activation via NetworkX.
@@ -53,6 +53,10 @@ class ActivationEngine:
         # 3. Score Seeds
         initial_activation = {}
         for b_id, node in G.nodes(data=True):
+            # Skip nodes implicitly added by edges (ghost nodes) that lack data
+            if 'subject' not in node:
+                continue
+
             score = 0
             # Simple keyword matching
             content = f"{node['subject']} {node['predicate']} {node['object']}".lower()
@@ -77,13 +81,14 @@ class ActivationEngine:
             ppr = initial_activation
 
         # 5. Rank and Filter
-        ranked_ids = sorted(ppr, key=ppr.get, reverse=True)[:AlphaConfig.TOP_K_ACTIVATION]
+        ranked_ids = sorted(ppr, key=ppr.get, reverse=True)[:limit]
         
         activated_beliefs = []
         for rid in ranked_ids:
             b = belief_map[rid]
             # Compute dynamic confidence before returning
             b['confidence'] = compute_confidence(b)
+            b['relevance_score'] = ppr.get(rid, 0) # Expose the PageRank score as relevance
             activated_beliefs.append(b)
             
         return activated_beliefs

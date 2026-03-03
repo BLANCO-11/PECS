@@ -3,6 +3,7 @@ import json
 from typing import List, Tuple, Dict, Optional
 from groq import Groq
 
+from config import AlphaConfig
 class SymbolicExtractor:
     def process(self, text: str) -> Optional[List[Tuple]]:
         """
@@ -88,7 +89,7 @@ class LLMExtractor:
             completion = self.client.chat.completions.create(
                 messages=[{"role": "system", "content": "You are a JSON extractor."},
                           {"role": "user", "content": prompt}],
-                model="llama-3.1-8b-instant", # Optimized: Lightweight model for structure
+                model=AlphaConfig.EXTRACTION_MODEL, # Optimized: Lightweight model for structure
                 temperature=0.0,
                 response_format={"type": "json_object"}
             )
@@ -100,7 +101,7 @@ class LLMExtractor:
             print(f"LLM Error: {e}")
             return {"proposed_beliefs": []}
 
-    def reason(self, text: str, active_beliefs: List[Dict], verbose: bool = False, model: str = "llama-3.1-8b-instant") -> str:
+    def reason(self, text: str, active_beliefs: List[Dict], verbose: bool = False, model: str = AlphaConfig.REASONING_MODEL_FAST) -> str:
         """
         High-level reasoning when deterministic logic fails.
         """
@@ -162,7 +163,7 @@ class LLMExtractor:
         completion = self.client.chat.completions.create(
             messages=[{"role": "system", "content": "You are a helpful synthesizer. You only rephrase provided facts."},
                       {"role": "user", "content": prompt}],
-            model="llama-3.1-8b-instant",
+            model=AlphaConfig.SYNTHESIZE_MODEL,
             temperature=0.3
         )
         if verbose and completion.usage:
@@ -194,7 +195,7 @@ class LLMExtractor:
             completion = self.client.chat.completions.create(
                 messages=[{"role": "system", "content": "You are a Knowledge Graph cleaner."},
                           {"role": "user", "content": prompt}],
-                model="llama-3.1-8b-instant",
+                model=AlphaConfig.MERGE_MODEL,
                 response_format={"type": "json_object"}
             )
             result = json.loads(completion.choices[0].message.content)
@@ -241,7 +242,7 @@ class LLMExtractor:
             completion = self.client.chat.completions.create(
                 messages=[{"role": "system", "content": "You are a research planner. You output Wikipedia-friendly search terms."},
                           {"role": "user", "content": prompt}],
-                model="llama-3.1-8b-instant",
+                model=AlphaConfig.RESEARCH_PLANNER_MODEL,
                 temperature=0.0,
                 response_format={"type": "json_object"}
             )
@@ -257,17 +258,21 @@ class LLMExtractor:
         Used to prevent 'rabbit hole' drifting during focused research.
         """
         prompt = f"""
-        I am researching '{root_topic}'. 
-        I found a reference to '{sub_topic}'.
-        Is '{sub_topic}' a core aspect of '{root_topic}' (like history, geography, key figures)?
-        Or is it tangential/unrelated?
+        I am researching the main topic: "{root_topic}"
         
-        Answer YES only if it is strictly relevant. Otherwise NO.
+        I have discovered a potential sub-topic: "{sub_topic}"
+        
+        Is this sub-topic directly related and useful for gaining a deeper understanding of the main topic?
+        
+        - Answer YES if it is a key concept, related field, important person/event, or foundational work.
+        - Answer NO if it is a tangent, a minor detail, or an unrelated concept.
+        
+        Answer with only YES or NO.
         """
         try:
             completion = self.client.chat.completions.create(
                 messages=[{"role": "user", "content": prompt}],
-                model="llama-3.1-8b-instant",
+                model=AlphaConfig.RELEVANCE_CHECK_MODEL,
                 max_tokens=5
             )
             response = completion.choices[0].message.content.strip().lower()
@@ -291,7 +296,7 @@ class LLMExtractor:
         try:
             completion = self.client.chat.completions.create(
                 messages=[{"role": "user", "content": prompt}],
-                model="llama-3.1-8b-instant",
+                model=AlphaConfig.RELEVANCE_CHECK_MODEL,
                 max_tokens=5
             )
             response = completion.choices[0].message.content.strip().lower()

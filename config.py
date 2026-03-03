@@ -1,7 +1,7 @@
 class AlphaConfig:
     # Identity Parameters (The "Soul" of the system)
-    MAX_BELIEFS = 5000
-    MAX_EDGES = 20000
+    MAX_BELIEFS = 100000
+    MAX_EDGES = 400000
     MAX_DEPTH = 5
     CONTRADICTION_THRESHOLD = 0.6
     
@@ -16,24 +16,44 @@ class AlphaConfig:
     ACTIVATION_DECAY = 0.5
     TOP_K_ACTIVATION = 10
     TOP_K_DEEP_THINK = 25
-    TOP_K_SYNTHESIZE = 10
+    # TOP_K_SYNTHESIZE = 10
     MIN_CONFIDENCE_FOR_CONTEXT = 0.6
     MIN_LLM_CONFIDENCE_TO_INGEST = 0.75 # New: Threshold for initial LLM extraction
     FORGET_RETENTION_DAYS = 3  # Days to keep low-evidence, unused beliefs
     CONSOLIDATION_THRESHOLD = 50  # Trigger consolidation after learning this many new beliefs
-    RESEARCH_EXISTING_KNOWLEDGE_THRESHOLD = 5 # Skip research if we have this many beliefs about the topic
+    MEMORY_PRESSURE_THRESHOLD = 0.8 # Only decay/prune when memory is > 80% full
 
     # Curiosity & Stability
     CURIOSITY_THRESHOLD = 0.5
     STABILITY_THRESHOLD = 0.3
     LLM_BUDGET_WINDOW = 10
     MAX_LLM_CALLS_IN_WINDOW = 20
-    RESEARCH_MAX_TIME_SECONDS = 60  # Max duration for a single research_topic call (prevents infinite rabbit holes)
+    # Research Time & Resource Limits
+    RESEARCH_MAX_TIME_SECONDS = 60  # Default max duration for a single research_topic call
+    RESEARCH_MAX_TIME_DEEPTHINK_SECONDS = 180 # Max duration for a deep think research call
+    RESEARCH_IGNORE_TIME_LIMIT = False # Override flag to ignore time limits for debugging/special cases
+    RESEARCH_MAX_SOURCES = 3 # Default number of web sources to process
+    RESEARCH_MAX_SOURCES_DEEPTHINK = 5 # Number of web sources to process in deep think mode
     MAX_CURIOSITY_GOALS_WINDOW = 2
     CURIOSITY_COOLDOWN_SECONDS = 60
     MAX_NEWS_HEADLINES = 5
     MAX_CHUNK_SIZE = 4000
     
+    INVERSE_PREDICATES = {
+        "is_a": "not_is_a",
+        "caused_by": "prevents",
+        "has": "not_has",
+        "likes": "dislikes"
+    }
+    # LLM Models
+    REASONING_MODEL_FAST = "llama-3.1-8b-instant"
+    REASONING_MODEL_DEEP = "llama-3.3-8b-versatile"
+    EXTRACTION_MODEL = "llama-3.1-8b-instant"
+    SYNTHESIZE_MODEL = "llama-3.1-8b-instant"
+    MERGE_MODEL = "llama-3.1-8b-instant"
+    RESEARCH_PLANNER_MODEL = "llama-3.1-8b-instant"
+    RELEVANCE_CHECK_MODEL = "llama-3.1-8b-instant"
+
     INVERSE_PREDICATES = {
         "is_a": "not_is_a",
         "caused_by": "prevents",
