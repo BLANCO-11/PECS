@@ -63,7 +63,7 @@ class PECSCore:
                 confidence = item.get('confidence', 0.0)
                 if s and p and o and confidence >= AlphaConfig.MIN_LLM_CONFIDENCE_TO_INGEST:
                     if verbose: print(f"  LLM proposed: ({s}, {p}, {o}) with confidence {confidence:.2f}")
-                    extracted_triples.append((s, p, o))
+                    extracted_triples.append((str(s), str(p), str(o)))
             
             # Deduplicate to prevent LLM repetition loops
             extracted_triples = list(set(extracted_triples))
