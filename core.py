@@ -135,7 +135,7 @@ class PECSCore:
         # Only consolidate if pruning is enabled (i.e., not in a batch operation)
         if prune and self.session_new_beliefs_count >= AlphaConfig.CONSOLIDATION_THRESHOLD:
             print(f"\n[System] Resting period: Consolidating after {self.session_new_beliefs_count} new beliefs...")
-            self.consolidate()
+            self.consolidate(verbose=verbose)
             self.session_new_beliefs_count = 0 # Reset counter
 
         return extracted_triples
@@ -178,7 +178,7 @@ class PECSCore:
         # Check for consolidation at the end of the batch operation.
         if self.session_new_beliefs_count >= AlphaConfig.CONSOLIDATION_THRESHOLD:
             print(f"\n[System] Resting period: Consolidating after batch learning ({self.session_new_beliefs_count} new beliefs)...")
-            self.consolidate()
+            self.consolidate(verbose=verbose)
             self.session_new_beliefs_count = 0 # Reset counter
 
         return all_triples
@@ -270,7 +270,7 @@ class PECSCore:
 
             print("Deterministic logic insufficient. Calling LLM Reasoner...")
             # Use a smarter model if deep_think is enabled
-            reasoning_model = "llama-3.3-70b-versatile" if self.deep_think_mode else "llama-3.1-8b-instant"
+            reasoning_model = AlphaConfig.REASONING_MODEL_DEEP if self.deep_think_mode else AlphaConfig.REASONING_MODEL_FAST
             self.current_interaction_llm_calls += 1
             response = self.llm.reason(user_input, active_context, verbose=verbose, model=reasoning_model)
 
@@ -323,7 +323,7 @@ class PECSCore:
             # Restore original deep think mode
             self.deep_think_mode = original_deep_think_mode
 
-    def consolidate(self):
+    def consolidate(self, verbose: bool = False):
         """
         Maintenance task: Looks for redundant beliefs and merges them.
         """
@@ -361,7 +361,7 @@ class PECSCore:
         
         # 4. Ask LLM for merges
         self.current_interaction_llm_calls += 1 # Tracking maintenance calls too
-        merges = self.llm.suggest_merges(candidate_beliefs[:AlphaConfig.TOP_K_DEEP_THINK]) # Use a configurable limit
+        merges = self.llm.suggest_merges(candidate_beliefs[:AlphaConfig.TOP_K_DEEP_THINK], verbose=verbose) # Use a configurable limit
         
         # 5. Apply merges
         for m in merges:
@@ -394,7 +394,7 @@ class PECSCore:
                 continue
 
             # Ensure the planned sub-topic is relevant to the original query
-            if not self.llm.check_relevance(root_topic, topic_name):
+            if not self.llm.check_relevance(root_topic, topic_name, verbose=verbose):
                 if verbose:
                     print(f"[Research] Pruning irrelevant sub-topic from plan: '{topic_name}' (not relevant to '{root_topic}')")
                 continue
@@ -431,7 +431,7 @@ class PECSCore:
             if not root_topic: root_topic = topic
             print(f"[Research] Planning a structured deep dive for '{topic}'...")
             
-            sub_topics = self.llm.plan_research(topic)
+            sub_topics = self.llm.plan_research(topic, verbose=verbose)
             
             # Create a parent goal for the overarching topic (container)
             # We use a slightly different description to avoid re-triggering planning for the root.
@@ -509,7 +509,7 @@ class PECSCore:
                         if verbose: print(f"[Research] Source limit ({source_limit}) reached. Stopping.")
                         break
 
-                    if not self.llm.check_search_result_relevance(topic, res['title'], res.get('summary') or ""):
+                    if not self.llm.check_search_result_relevance(topic, res['title'], res.get('summary') or "", verbose=verbose):
                         if verbose: print(f"  [Research] Skipping irrelevant: {res['title']}")
                         continue
 
@@ -567,7 +567,7 @@ class PECSCore:
             else:
                 # User Mode: Stick to the original query.
                 # Only dive if strictly relevant to the root topic.
-                if root_topic and self.llm.check_relevance(root_topic, spark):
+                if root_topic and self.llm.check_relevance(root_topic, spark, verbose=verbose):
                     print(f"[Research] Focused: '{spark}' is relevant to '{root_topic}'. Diving deeper...")
                     # Do not pass start_time, so each sub-topic gets its own fresh time budget.
                     # The depth limit prevents infinite recursion.
@@ -634,7 +634,7 @@ class PECSCore:
         # Check for consolidation at the end of the news session.
         if self.session_new_beliefs_count >= AlphaConfig.CONSOLIDATION_THRESHOLD:
             print(f"\n[System] Resting period: Consolidating after news session ({self.session_new_beliefs_count} new beliefs)...")
-            self.consolidate()
+            self.consolidate(verbose=verbose)
             self.session_new_beliefs_count = 0 # Reset counter
 
         print("\n[News] Session complete.")

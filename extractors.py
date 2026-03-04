@@ -13,23 +13,38 @@ class SymbolicExtractor:
         text = text.lower().strip()
         triples = []
 
+        # Helper to filter noise immediately
+        def is_clean(s, o):
+            # Reject if subject is a stopword (e.g. "which", "it")
+            if s in AlphaConfig.STOP_WORDS: return False
+            # Reject if object is too long (likely a complex sentence clause, not a simple entity)
+            if len(o) > 80 or '\n' in o: return False 
+            return True
+
         # Rule 1: Preference "I prefer X"
         match = re.search(r"i prefer ([\w\s]+)", text)
         if match:
-            triples.append(("user", "prefers", match.group(1).strip()))
-            return triples
+            s, o = "user", match.group(1).strip()
+            if is_clean(s, o):
+                triples.append((s, "prefers", o))
+                return triples
 
         # Rule 2: Definition "X is a Y"
-        match = re.search(r"([\w\s]+) is a ([\w\s]+)", text)
+        # Use [^\n] to prevent matching across lines
+        match = re.search(r"([\w\s]+) is a ([^\n]+)", text)
         if match:
-            triples.append((match.group(1).strip(), "is_a", match.group(2).strip()))
-            return triples
+            s, o = match.group(1).strip(), match.group(2).strip()
+            if is_clean(s, o):
+                triples.append((s, "is_a", o))
+                return triples
             
         # Rule 3: Comparison "X is better than Y"
-        match = re.search(r"([\w\s]+) is better than ([\w\s]+)", text)
+        match = re.search(r"([\w\s]+) is better than ([^\n]+)", text)
         if match:
-            triples.append((match.group(1).strip(), "preferred_over", match.group(2).strip()))
-            return triples
+            s, o = match.group(1).strip(), match.group(2).strip()
+            if is_clean(s, o):
+                triples.append((s, "preferred_over", o))
+                return triples
 
         return None
 
@@ -103,28 +118,34 @@ class LLMExtractor:
 
     def reason(self, text: str, active_beliefs: List[Dict], verbose: bool = False, model: str = AlphaConfig.REASONING_MODEL_FAST) -> str:
         """
-        High-level reasoning when deterministic logic fails.
+        High-level reasoning using Single-Pass Grounded Chain of Thought (CoT).
         """
-        # Safety: Limit context to prevent token overflow, though core usually handles this.
-        # We use the limit passed by the caller (Core), allowing for Deep Think modes.
-        triples = [f"{b['subject']} {b['predicate']} {b['object']}" for b in active_beliefs]
+        # Format context with IDs for citation
+        indexed_facts = []
+        for i, b in enumerate(active_beliefs, 1):
+            fact_str = f"[{i}] {b['subject']} {b['predicate']} {b['object']}"
+            indexed_facts.append(fact_str)
+        
+        context_str = "\n".join(indexed_facts)
         
         if verbose:
-            print(f"--- [DEBUG] Sending to LLM (Reason Context) ---\n{triples}\n-----------------------------------------------")
+            print(f"--- [DEBUG] Sending to LLM (Reason Context) ---\n{context_str}\n-----------------------------------------------")
 
         prompt = f"""
         You are an AI assistant using a retrieved memory bank.
         
         Memory Context:
-        {json.dumps(triples, indent=2)}
+        {context_str}
         
         User Question: "{text}"
         
         Task:
-        Answer the question comprehensively using ONLY the Memory Context. 
-        Synthesize the facts into a coherent paragraph. 
-        If the memory contains details about roles, achievements, or definitions, include them.
-        Do not use external knowledge.
+        Answer the question using ONLY the Memory Context.
+        
+        Format your response exactly as follows:
+        RELEVANT_FACTS: [List the IDs (e.g. [1], [4]) of the facts that are relevant to the question. If none, say None.]
+        REASONING: [Step-by-step logic. You MUST cite the fact IDs for every claim you make. This is your internal thought process.]
+        ANSWER: [Synthesize the key points from your REASONING section into a comprehensive, natural-sounding paragraph. Directly answer the user's question based on the cited facts. Do not add new information. Response should be Rich with the info you have.]
         """
         
         completion = self.client.chat.completions.create(
@@ -136,7 +157,20 @@ class LLMExtractor:
         if verbose and completion.usage:
             u = completion.usage
             print(f"  [LLM Reason]  Prompt: {u.prompt_tokens} | Completion: {u.completion_tokens} | Total: {u.total_tokens}")
-        return completion.choices[0].message.content
+            
+        raw_response = completion.choices[0].message.content
+        
+        # Parse the structured response
+        answer_match = re.search(r"ANSWER:\s*(.*)", raw_response, re.DOTALL)
+        if answer_match:
+            final_answer = answer_match.group(1).strip()
+            if verbose:
+                reasoning_match = re.search(r"REASONING:\s*(.*?)\nANSWER:", raw_response, re.DOTALL)
+                if reasoning_match:
+                    print(f"\n[CoT Reasoning]\n{reasoning_match.group(1).strip()}\n")
+            return final_answer
+        else:
+            return raw_response
 
     def synthesize(self, query: str, beliefs: List[Dict], verbose: bool = False) -> str:
         """
@@ -154,8 +188,8 @@ class LLMExtractor:
         Turn these facts into a natural response that answers the query. 
         Rules:
         1. Smooth out the phrasing to sound natural.
-        2. Do NOT add new info or external knowledge.
-        3. Stick strictly to the facts provided. Dont use a fact in the prompt if it is not relevant to query.
+        2. Stick strictly to the facts provided. Do NOT add new info or external knowledge.
+        3. Weave the facts together into a coherent paragraph.
         
         Facts: {json.dumps(triples)}
         """
@@ -171,7 +205,7 @@ class LLMExtractor:
             print(f"  [LLM Synth]   Prompt: {u.prompt_tokens} | Completion: {u.completion_tokens} | Total: {u.total_tokens}")
         return completion.choices[0].message.content
 
-    def suggest_merges(self, beliefs: List[Dict]) -> List[Dict]:
+    def suggest_merges(self, beliefs: List[Dict], verbose: bool = False) -> List[Dict]:
         """
         Identifies beliefs that are semantically identical and should be merged.
         """
@@ -198,6 +232,9 @@ class LLMExtractor:
                 model=AlphaConfig.MERGE_MODEL,
                 response_format={"type": "json_object"}
             )
+            if verbose and completion.usage:
+                u = completion.usage
+                print(f"  [LLM Merge]   Prompt: {u.prompt_tokens} | Completion: {u.completion_tokens} | Total: {u.total_tokens}")
             result = json.loads(completion.choices[0].message.content)
             
             candidates = []
@@ -212,7 +249,7 @@ class LLMExtractor:
             print(f"Merge Error: {e}")
             return []
 
-    def plan_research(self, topic: str) -> List[str]:
+    def plan_research(self, topic: str, verbose: bool = False) -> List[str]:
         """
         Generates a structured research plan (sub-topics) for a given topic.
         """
@@ -246,13 +283,16 @@ class LLMExtractor:
                 temperature=0.0,
                 response_format={"type": "json_object"}
             )
+            if verbose and completion.usage:
+                u = completion.usage
+                print(f"  [LLM Plan]    Prompt: {u.prompt_tokens} | Completion: {u.completion_tokens} | Total: {u.total_tokens}")
             result = json.loads(completion.choices[0].message.content)
             return result.get("sub_topics", [])
         except Exception as e:
             print(f"Research Planning Error: {e}")
             return []
 
-    def check_relevance(self, root_topic: str, sub_topic: str) -> bool:
+    def check_relevance(self, root_topic: str, sub_topic: str, verbose: bool = False) -> bool:
         """
         Determines if a sub_topic is strictly relevant to the root_topic.
         Used to prevent 'rabbit hole' drifting during focused research.
@@ -275,12 +315,15 @@ class LLMExtractor:
                 model=AlphaConfig.RELEVANCE_CHECK_MODEL,
                 max_tokens=5
             )
+            if verbose and completion.usage:
+                u = completion.usage
+                print(f"  [LLM Relev]   Prompt: {u.prompt_tokens} | Completion: {u.completion_tokens} | Total: {u.total_tokens}")
             response = completion.choices[0].message.content.strip().lower()
             return "yes" in response
         except Exception:
             return False
 
-    def check_search_result_relevance(self, topic: str, title: str, snippet: str) -> bool:
+    def check_search_result_relevance(self, topic: str, title: str, snippet: str, verbose: bool = False) -> bool:
         """
         Determines if a search result is relevant to the research topic.
         """
@@ -299,6 +342,9 @@ class LLMExtractor:
                 model=AlphaConfig.RELEVANCE_CHECK_MODEL,
                 max_tokens=5
             )
+            if verbose and completion.usage:
+                u = completion.usage
+                print(f"  [LLM Search]  Prompt: {u.prompt_tokens} | Completion: {u.completion_tokens} | Total: {u.total_tokens}")
             response = completion.choices[0].message.content.strip().lower()
             return "yes" in response
         except Exception:

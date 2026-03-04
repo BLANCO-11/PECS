@@ -47,7 +47,7 @@ class AlphaConfig:
     }
     # LLM Models
     REASONING_MODEL_FAST = "llama-3.1-8b-instant"
-    REASONING_MODEL_DEEP = "llama-3.3-8b-versatile"
+    REASONING_MODEL_DEEP = "llama-3.1-8b-instant"
     EXTRACTION_MODEL = "llama-3.1-8b-instant"
     SYNTHESIZE_MODEL = "llama-3.1-8b-instant"
     MERGE_MODEL = "llama-3.1-8b-instant"
