@@ -665,6 +665,11 @@ class PECSCore:
                         self.research_topic(topic, verbose=verbose, is_autonomous=True, plan_first=False)
                         self.memory.complete_goal(next_goal['id'])
                         print(f"[Goal] Marked '{next_goal['description']}' as achieved.")
+
+                    elif next_goal['description'].startswith("Deep Dive "):
+                        # Container goal for a research plan. Mark as achieved to unblock sub-goals.
+                        self.memory.complete_goal(next_goal['id'])
+                        print(f"[Goal] Processed container: '{next_goal['description']}'.")
                     
                     # Short pause between goals, then loop back to check for more goals
                     time.sleep(2) 
