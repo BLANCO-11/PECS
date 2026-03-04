@@ -109,6 +109,21 @@ class PECSCore:
                     
                     if not n_tokens.isdisjoint(c_tokens):
                         self.memory.add_edge(source_id=context_belief['id'], target_id=new_id, edge_type='related_to', weight=0.5)
+
+        # 5. Structural Rooting (Anchor to Focus Topic)
+        # If we are learning about a specific topic, ensure new beliefs are physically linked to it.
+        if focus_topic and newly_created_ids:
+            # Tokenize focus topic for search
+            focus_tokens = [t for t in re.findall(r'\w+', focus_topic.lower()) if t not in AlphaConfig.STOP_WORDS]
+            if focus_tokens:
+                # Find the best existing belief to serve as the "Root" for this topic
+                root_candidates = self.memory.search_beliefs(focus_tokens, limit=1)
+                if root_candidates:
+                    root_id = root_candidates[0]['id']
+                    for new_id in newly_created_ids:
+                        if new_id != root_id:
+                            # Link Root -> New Belief to create a cluster
+                            self.memory.add_edge(source_id=root_id, target_id=new_id, edge_type='has_context', weight=0.8)
         
         self.memory.conn.commit()
         

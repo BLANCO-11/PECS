@@ -67,7 +67,7 @@ if __name__ == "__main__":
     
     # Mode 4: Autonomous Discovery (Self-Learning)
     # The system will fetch news, learn headlines, and research unknown topics automatically.
-    # core.autonomous_discovery()
+    # core.autonomous_discovery(verbose=True)
     
     # Mode 5: Focused Research (Self-Learning but sticks to a topic)
     # core.research_topic("research Quantum Physics", verbose=True)
