@@ -191,6 +191,12 @@ class MemoryStore:
         cur.execute("SELECT 1 FROM goals WHERE status = 'achieved' AND (description = ? OR description LIKE ?)", (pattern_exact, pattern_sub))
         return cur.fetchone() is not None
 
+    def is_goal_achieved(self, description):
+        """Checks if a specific goal description has been achieved."""
+        cur = self.conn.cursor()
+        cur.execute("SELECT 1 FROM goals WHERE status = 'achieved' AND description = ?", (description,))
+        return cur.fetchone() is not None
+
     def add_goal(self, description, priority=1, parent_id=None):
         """Adds a new goal if it doesn't already exist in pending state."""
         cur = self.conn.cursor()

@@ -445,10 +445,12 @@ class PECSCore:
 
         # Check Knowledge Base (Deduplication)
         if not force:
-            # Check if we have already completed a goal for this topic
-            if self.memory.is_research_goal_achieved(topic):
+            # Deduplicate based on the intent (Planning vs Execution)
+            check_desc = f"Research {topic}" if plan_first else f"Execute Research {topic}"
+            
+            if self.memory.is_goal_achieved(check_desc):
                 if verbose: 
-                    print(f"[Research] Skipping '{topic}': Goal already achieved in the past.")
+                    print(f"[Research] Skipping '{topic}': Goal '{check_desc}' already achieved.")
                 return
 
         # Check Time Budget
