@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PECS | Neural Core</title>
+    
+    <script src="https://cdn.socket.io/4.7.4/socket.io.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js"></script>
+    
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500&family=Space+Grotesk:wght@300;400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <style>
+        #drag-handle {
+            position: absolute; top: 0; right: -5px; width: 10px; height: 100%;
+            cursor: col-resize; z-index: 100; user-select: none;
+        }
+        #drag-handle:hover { background: rgba(255,255,255,0.05); }
+        
+        body.no-render #viewport { display: none !important; }
+        body.no-render #sidebar { width: 100% !important; max-width: none !important; border-right: none; background: #02020b; }
+        body.no-render #chat-history { max-width: 900px; margin: 0 auto; width: 100%; }
+        body.no-render #controls { max-width: 900px; margin: 0 auto; width: 100%; }
+        
+        @keyframes pulse-opacity {
+            0% { opacity: 0.4; } 50% { opacity: 1; } 100% { opacity: 0.4; }
+        }
+    </style>
+</head>
+<body>
+
+    <!-- Ambient Background -->
+    <div id="bg-glow"></div>
+
+    <!-- Left Sidebar: Chat & Control -->
+    <div id="sidebar" class="glass">
+        <div id="drag-handle"></div>
+        <div id="brand" style="display: flex; align-items: center; position: relative;">
+            <div class="brand-dot"></div>
+            <div class="brand-text">
+                <h1>PECS CORE</h1>
+                <p>NEURAL COGNITIVE ENGINE</p>
+            </div>
+            <button class="toggle-btn active" id="btn-visualizer" style="position: absolute; right: 0; font-size: 0.65rem; padding: 4px 10px; height: fit-content;">
+                <span style="margin-right: 6px;">👁</span>VISUALIZER
+            </button>
+        </div>
+
+        <div id="chat-history">
+            <div class="msg ai">Core initialized. Neural interface active.</div>
+        </div>
+
+        <div id="controls">
+            <div class="toggles">
+                <button class="toggle-btn" id="btn-verbose">VERBOSE</button>
+                <button class="toggle-btn" id="btn-deep">DEEP THINK</button>
+                <button class="toggle-btn" id="btn-auto">AUTO</button>
+            </div>
+            <div class="input-box">
+                <textarea id="user-input" placeholder="Inject parameter..."></textarea>
+                <button id="send-btn">↑</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Center: Visualization -->
+    <div id="viewport">
+        <!-- Loading Screen -->
+        <div id="visualizer-loader" style="display: none; position: absolute; inset: 0; background: #02020b; z-index: 2000; align-items: center; justify-content: center; flex-direction: column;">
+            <div class="brand-dot" style="width: 12px; height: 12px; animation: pulse-opacity 1.5s infinite;"></div>
+            <div style="margin-top: 12px; font-family: 'Space Grotesk', sans-serif; font-size: 0.8rem; color: #64748b; letter-spacing: 0.1em;">INITIALIZING CORE...</div>
+        </div>
+        <!-- Canvas is injected here by JS -->
+        <div id="graph-container"></div>
+        
+        <!-- HUD Stats -->
+        <div id="status-pill">
+            <span class="brand-dot" style="width:6px;height:6px;"></span>
+            Connecting...
+        </div>
+
+        <!-- NEW: Token Counter -->
+        <div id="token-pill" style="
+            position: absolute; top: 60px; left: 50%; transform: translateX(-50%);
+            padding: 6px 14px; border-radius: 16px;
+            background: rgba(15, 23, 42, 0.6); border: 1px solid rgba(56, 189, 248, 0.1);
+            color: #64748b; font-family: 'IBM Plex Mono', monospace; font-size: 0.6rem;
+            backdrop-filter: blur(4px); transition: all 0.3s;
+            pointer-events: none; display: flex; align-items: center; gap: 6px;
+        ">
+            TOKENS: <span id="token-count" style="color: #94a3b8; font-weight: 600;">0</span>
+        </div>
+
+        <div id="auto-badge">AUTONOMOUS MODE ACTIVE</div>
+
+        <!-- NEW: Cluster Navigation Box -->
+        <div id="cluster-nav" class="glass" style="position: absolute; top: 20px; right: 20px; width: 220px; max-height: 300px; display: flex; flex-direction: column; border-radius: 12px; transition: all 0.3s ease; overflow: hidden;">
+            <div id="cluster-header" style="padding: 12px 16px; border-bottom: 1px solid rgba(255,255,255,0.1); cursor: pointer; display: flex; justify-content: space-between; align-items: center; background: rgba(255,255,255,0.02);">
+                <span style="font-family: 'Space Grotesk', sans-serif; font-weight: 600; font-size: 0.8rem; color: #e2e8f0; letter-spacing: 0.05em;">MAJOR CLUSTERS</span>
+                <span id="cluster-toggle" style="font-size: 0.8rem; color: #94a3b8;">▼</span>
+            </div>
+            <div id="cluster-list" style="overflow-y: auto; padding: 4px 0;">
+                <!-- Items injected by JS -->
+                <div style="padding: 12px; text-align: center; color: #64748b; font-size: 0.7rem;">Scanning topology...</div>
+            </div>
+        </div>
+
+        <!-- Physics Toggle -->
+        <div id="phy-toggle">⚡</div>
+        
+        <!-- Physics Controls (Hidden by default) -->
+        <div id="physics-controls" class="glass" style="padding:16px; border-radius:12px;">
+            <div class="phy-row">
+                <span>REPULSION</span>
+                <input type="range" id="rng-rep" min="100" max="2000" value="600">
+            </div>
+            <div class="phy-row">
+                <span>LINK DISTANCE</span>
+                <input type="range" id="rng-dist" min="50" max="500" value="120">
+            </div>
+        </div>
+    </div>
+
+    <!-- Right: Inspector Slide-out -->
+    <div id="node-inspector" class="glass" style="border-radius: 16px;">
+        <div class="ins-header">
+            <div class="ins-title" id="ins-title">Node Details</div>
+            <button class="ins-close">×</button>
+        </div>
+        <div class="ins-content">
+            
+            <!-- 1. Basic Metadata -->
+            <div class="meta-group">
+                <div class="meta-grid">
+                    <div>
+                        <div class="meta-label">ID</div>
+                        <div id="meta-id" class="meta-value" style="font-size:0.65rem;"></div>
+                    </div>
+                    <div>
+                        <div class="meta-label">TYPE</div>
+                        <div id="meta-type" class="meta-value" style="color:var(--accent)"></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- 2. Statement Triplet -->
+            <div class="meta-group">
+                <div style="margin-bottom:8px;">
+                    <div class="meta-label">SUBJECT</div>
+                    <div id="meta-sub" class="meta-value"></div>
+                </div>
+                <div style="margin-bottom:8px;">
+                    <div class="meta-label">PREDICATE</div>
+                    <div id="meta-pred" class="meta-value" style="color:#94a3b8"></div>
+                </div>
+                <div>
+                    <div class="meta-label">OBJECT</div>
+                    <div id="meta-obj" class="meta-value"></div>
+                </div>
+            </div>
+
+            <!-- 3. Neural Metrics Grid -->
+            <div class="meta-group">
+                <div class="meta-label" style="margin-bottom:12px;">NEURAL METRICS</div>
+                <div class="meta-grid">
+                    <div>
+                        <div class="meta-label">EVIDENCE</div>
+                        <div id="score-evidence" class="meta-value highlight"></div>
+                    </div>
+                    <div>
+                        <div class="meta-label">CONTRADICTION</div>
+                        <div id="score-contra" class="meta-value" style="color:#f87171;"></div>
+                    </div>
+                    <div>
+                        <div class="meta-label">STRUCT. SUPPORT</div>
+                        <div id="score-struct" class="meta-value"></div>
+                    </div>
+                    <div>
+                        <div class="meta-label">USAGE COUNT</div>
+                        <div id="score-usage" class="meta-value"></div>
+                    </div>
+                </div>
+                <div style="margin-top:12px;">
+                    <div class="meta-label">DECAY RATE</div>
+                    <div id="meta-decay" class="meta-value"></div>
+                </div>
+            </div>
+
+            <!-- 4. Connections -->
+            <div style="padding: 16px 20px;">
+                <div class="conn-list" id="conn-list">
+                    <!-- Connections injected here -->
+                </div>
+            </div>
+
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>
