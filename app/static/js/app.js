@@ -8,7 +8,7 @@ const socket = io();
 // Data & State
 let nodes = [];
 let links = [];
-let simulation = null;
+let simulationWorker = null;
 let canvas, ctx;
 let width, height;
 let renderingEnabled = true;
@@ -108,6 +108,21 @@ function initCanvas() {
             .on("end", dragEnded))
         .on("mousemove", handleMouseMove)
         .on("click", handleClick);
+
+    // Initialize Worker
+    simulationWorker = new Worker('/static/js/simulation.worker.js');
+    simulationWorker.onmessage = (e) => {
+        if (e.data.type === 'tick') {
+            const positions = e.data.positions;
+            // Sync positions from worker
+            if (nodes.length * 2 === positions.length) {
+                for (let i = 0; i < nodes.length; i++) {
+                    nodes[i].x = positions[i * 2];
+                    nodes[i].y = positions[i * 2 + 1];
+                }
+            }
+        }
+    };
 }
 
 function resize() {
@@ -214,21 +229,14 @@ function mergeGraphData(data) {
 
     updateClusterNav(); 
 
-    if (!simulation) {
-        simulation = d3.forceSimulation(nodes)
-            .force("charge", d3.forceManyBody().strength(d => d.degree <= 1 ? -100 : CONFIG.physics.repulsion))
-            .force("link", d3.forceLink(links).id(d => d.id).distance(CONFIG.physics.distance))
-            .force("center", d3.forceCenter(0, 0))
-            .force("collide", d3.forceCollide(d => 8 + Math.sqrt(d.degree)))
-            .stop(); 
-            
-        for (let i = 0; i < 40; ++i) simulation.tick();
-        
-        if (renderingEnabled) simulation.restart();
-    } else {
-        simulation.nodes(nodes);
-        simulation.force("link").links(links);
-        if (renderingEnabled) simulation.alpha(0.3).restart(); 
+    // Offload to worker
+    if (simulationWorker) {
+        simulationWorker.postMessage({
+            type: 'init',
+            nodes: nodes.map(n => ({id: n.id, x: n.x, y: n.y, degree: n.degree})),
+            links: links.map(l => ({source_id: l.source.id, target_id: l.target.id})),
+            config: { distance: CONFIG.physics.distance, repulsion: CONFIG.physics.repulsion }
+        });
     }
 
     updateStatus(`${nodes.length} Nodes Active`);
@@ -671,7 +679,7 @@ function drawPath(link, simplify, preCalcDist) {
 
 function handleMouseMove(e) {
     const [simX, simY] = transform.invert(d3.pointer(e));
-    const closest = simulation.find(simX, simY, 20 / transform.k); 
+    const closest = findNode(simX, simY, 20 / transform.k);
 
     if(closest !== highlightedNode) {
         highlightedNode = closest;
@@ -694,27 +702,54 @@ function handleClick(e) {
     else closeInspector();
 }
 
+function findNode(x, y, radius) {
+    let closest = null;
+    let minDst = radius * radius;
+    for (const n of nodes) {
+        const dx = x - n.x;
+        const dy = y - n.y;
+        const dst = dx*dx + dy*dy;
+        if (dst < minDst) {
+            minDst = dst;
+            closest = n;
+        }
+    }
+    return closest;
+}
+
 function dragSubject(e) {
     const [simX, simY] = transform.invert(d3.pointer(e));
-    return simulation.find(simX, simY, 30 / transform.k);
+    return findNode(simX, simY, 30 / transform.k);
 }
 
 function dragStarted(e) {
-    if (!e.active) simulation.alphaTarget(0.3).restart();
+    if (!e.active) simulationWorker.postMessage({ type: 'reheat', alpha: 0.3 });
     e.subject.fx = e.subject.x;
     e.subject.fy = e.subject.y;
+    const index = nodes.indexOf(e.subject);
+    if (index !== -1) {
+        simulationWorker.postMessage({ type: 'fix', index: index, x: e.subject.x, y: e.subject.y });
+    }
 }
 
 function dragged(e) {
     const [simX, simY] = transform.invert(d3.pointer(e));
     e.subject.fx = simX;
     e.subject.fy = simY;
+    const index = nodes.indexOf(e.subject);
+    if (index !== -1) {
+        simulationWorker.postMessage({ type: 'fix', index: index, x: simX, y: simY });
+    }
 }
 
 function dragEnded(e) {
-    if (!e.active) simulation.alphaTarget(0);
+    if (!e.active) simulationWorker.postMessage({ type: 'reheat', alpha: 0 });
     e.subject.fx = null;
     e.subject.fy = null;
+    const index = nodes.indexOf(e.subject);
+    if (index !== -1) {
+        simulationWorker.postMessage({ type: 'unfix', index: index });
+    }
 }
 
 // === INSPECTOR LOGIC ===
@@ -797,7 +832,7 @@ function setupUI() {
             if (!renderingEnabled) {
                 lastSidebarWidth = document.getElementById('sidebar').style.width;
                 document.body.classList.add('no-render');
-                if (simulation) simulation.stop();
+                if (simulationWorker) simulationWorker.postMessage({ type: 'stop' });
             } else {
                 const loader = document.getElementById('visualizer-loader');
                 if (loader) loader.style.display = 'flex';
@@ -807,7 +842,7 @@ function setupUI() {
                     document.body.classList.remove('no-render');
                     if(lastSidebarWidth) document.getElementById('sidebar').style.width = lastSidebarWidth;
                     resize(); 
-                    if (simulation) simulation.alpha(0.1).restart();
+                    if (simulationWorker) simulationWorker.postMessage({ type: 'reheat', alpha: 0.1 });
                     
                     // Hide loader after a brief moment to ensure smooth transition
                     setTimeout(() => { if (loader) loader.style.display = 'none'; }, 400);
@@ -872,11 +907,11 @@ function setupUI() {
     
     if(rngRep) rngRep.oninput = (e) => { 
         CONFIG.physics.repulsion = -Math.abs(+e.target.value); 
-        initSimulation(); simulation.alpha(0.3).restart(); 
+        simulationWorker.postMessage({ type: 'updateConfig', config: { repulsion: CONFIG.physics.repulsion } });
     };
     if(rngDist) rngDist.oninput = (e) => { 
         CONFIG.physics.distance = +e.target.value; 
-        initSimulation(); simulation.alpha(0.3).restart(); 
+        simulationWorker.postMessage({ type: 'updateConfig', config: { distance: CONFIG.physics.distance } });
     };
 }
 
@@ -943,9 +978,13 @@ socket.on('belief_created', (newNode) => {
     activationLevels.set(String(newNode.id), 1.0);
     updateClusterNav(); 
 
-    if (simulation && renderingEnabled) {
-        simulation.nodes(nodes);
-        simulation.alpha(0.3).restart();
+    if (simulationWorker && renderingEnabled) {
+        simulationWorker.postMessage({
+            type: 'init',
+            nodes: nodes.map(n => ({id: n.id, x: n.x, y: n.y, degree: n.degree})),
+            links: links.map(l => ({source_id: l.source.id, target_id: l.target.id})),
+            config: { distance: CONFIG.physics.distance }
+        });
     }
 });
 
@@ -965,9 +1004,13 @@ socket.on('edge_created', (newEdge) => {
         
         updateClusterNav(); 
 
-        if (simulation && renderingEnabled) {
-            simulation.force("link").links(links);
-            simulation.alpha(0.3).restart();
+        if (simulationWorker && renderingEnabled) {
+            simulationWorker.postMessage({
+                type: 'init',
+                nodes: nodes.map(n => ({id: n.id, x: n.x, y: n.y, degree: n.degree})),
+                links: links.map(l => ({source_id: l.source.id, target_id: l.target.id})),
+                config: { distance: CONFIG.physics.distance }
+            });
         }
     }
 });
