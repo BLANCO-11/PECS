@@ -1,10 +1,9 @@
 /**
- * PECS Simulation Worker v3.0 - Organic Neural Physics
- * Prevents "Box" quadtree artifacts by scaling forces based on density
- * and applying a radial membrane force to shape the network.
+ * PECS Simulation Worker v4.0 - Static Neural Generation
+ * Replaces physics engine with deterministic mathematical layout
+ * for instant rendering of massive datasets (20k-100k+ nodes).
  */
 
-importScripts('https://cdnjs.cloudflare.com/ajax/libs/d3/7.8.5/d3.min.js');
 
 let simulation = null;
 let simNodes = [];
@@ -15,95 +14,94 @@ self.onmessage = function(e) {
     if (type === 'init') {
         simNodes = nodes;
 
-        // Spawn nodes in a tight sphere instead of a massive galaxy
-        simNodes.forEach(n => {
-            if (!Number.isFinite(n.x) || !Number.isFinite(n.y)) {
-                const r = Math.pow(Math.random(), 0.5) * 1500;
-                const a = Math.random() * 2 * Math.PI;
-                n.x = Math.cos(a) * r;
-                n.y = Math.sin(a) * r;
-            }
+        // 1. Build Adjacency Map for O(1) lookup
+        const adj = new Map();
+        nodes.forEach(n => adj.set(n.id, []));
+        links.forEach(l => {
+            if(adj.has(l.source_id)) adj.get(l.source_id).push(l.target_id);
+            if(adj.has(l.target_id)) adj.get(l.target_id).push(l.source_id);
         });
 
-        const nodeMap = new Map(simNodes.map((n, i) => [n.id, i]));
-        const indexedLinks = links
-            .map(l => ({
-                source: nodeMap.get(l.source_id),
-                target: nodeMap.get(l.target_id),
-                source_id: l.source_id,
-                target_id: l.target_id
-            }))
-            .filter(l => l.source !== undefined && l.target !== undefined);
+        // 2. Sort by degree (descending) to place Hubs first
+        // We create a sorted index to process nodes in order without breaking the original array order
+        const sortedIndices = simNodes.map((n, i) => i).sort((a, b) => 
+            (simNodes[b].degree || 0) - (simNodes[a].degree || 0)
+        );
 
-        const nodeCount = simNodes.length;
-        const isMassive = nodeCount > 2000;
+        const placed = new Set();
+        const nodeMap = new Map(simNodes.map(n => [n.id, n]));
         
-        // Use config values if provided, otherwise fallback to stronger defaults
-        const repulseStrength = config.repulsion || (isMassive ? -400 : -800);
-        const linkDistance = config.distance || 100;
+        // Scale spread based on node count to prevent congestion
+        const baseSpread = config.distance || 120;
+        const spread = simNodes.length > 2000 ? baseSpread * 12.0 : baseSpread;
         
-        if (simulation) simulation.stop();
+        // 3. Mathematical Layout Generation
+        sortedIndices.forEach((index, i) => {
+            const node = simNodes[index];
+            
+            // Find neighbors that have already been placed
+            const neighbors = adj.get(node.id) || [];
+            const placedNeighbors = neighbors
+                .map(id => nodeMap.get(id))
+                .filter(n => placed.has(n.id));
 
-        simulation = d3.forceSimulation(simNodes)
-            .force("charge", d3.forceManyBody()
-                .strength(repulseStrength)
-                .distanceMax(isMassive ? 5000 : 10000)
-                .theta(0.9)
-            )
-            .force("link", d3.forceLink(indexedLinks)
-                .distance(d => {
-                    // Organic variation: +/- 30% of target distance to break orbital rings
-                    return linkDistance * (0.7 + Math.random() * 0.6);
-                })
-                .iterations(1)
-            )
-            .force("collide", d3.forceCollide()
-                .radius(d => (d.degree ? Math.sqrt(d.degree) * 4 : 3) + 4)
-                .strength(0.6)
-                .iterations(1)
-            )
-            .force("x", d3.forceX(0).strength(isMassive ? 0.015 : 0.04))
-            .force("y", d3.forceY(0).strength(isMassive ? 0.015 : 0.04))
-            .alphaDecay(0.01)
-            .velocityDecay(0.6) 
-            .on('tick', sendPositions)
-            .on('end', () => {
-                sendPositions();
-                self.postMessage({ type: 'end' });
-            });
+            if (placedNeighbors.length > 0) {
+                // CLUSTER STRATEGY: Place near connected neighbors
+                let avgX = 0, avgY = 0;
+                placedNeighbors.forEach(n => { avgX += n.x; avgY += n.y; });
+                avgX /= placedNeighbors.length;
+                avgY /= placedNeighbors.length;
+
+                // CLUSTER BIAS: Push clusters away from the center to avoid middle congestion
+                // Calculate angle from center (0,0) to the average position
+                const angleFromCenter = Math.atan2(avgY, avgX);
+                const pushOut = spread * 2.5;
+                
+                // Place node: Average of neighbors + Push outward + Organic Jitter
+                node.x = avgX + Math.cos(angleFromCenter) * pushOut + (Math.random() - 0.5) * spread;
+                node.y = avgY + Math.sin(angleFromCenter) * pushOut + (Math.random() - 0.5) * spread;
+            } else {
+                // SPIRAL STRATEGY: Place hubs/disconnected nodes on a Phyllotaxis spiral
+                // Golden Angle = ~2.4 radians
+                const angle = i * 2.4;
+                // Power 0.6 spreads outer nodes more than sqrt (0.5), reducing center density
+                const radius = spread * Math.pow(i + 10, 0.65) * 3.0; 
+                
+                node.x = Math.cos(angle) * radius;
+                node.y = Math.sin(angle) * radius;
+            }
+            
+            placed.add(node.id);
+        });
+
+        // Render once and stop
+        sendPositions();
+        self.postMessage({ type: 'end' });
     }
 
     if (type === 'reheat') {
-        if (!simulation) return;
-        simulation.alpha(e.data.alpha || 0.3).restart();
+        // Physics disabled - no reheat needed
     }
 
     if (type === 'fix') {
-        if (simulation && simNodes[e.data.index]) {
-            simNodes[e.data.index].fx = e.data.x;
-            simNodes[e.data.index].fy = e.data.y;
+        // Manual drag handling without physics
+        if (simNodes[e.data.index]) {
+            simNodes[e.data.index].x = e.data.x;
+            simNodes[e.data.index].y = e.data.y;
+            sendPositions(); // Instant update
         }
     }
 
     if (type === 'unfix') {
-        if (simulation && simNodes[e.data.index]) {
-            simNodes[e.data.index].fx = null;
-            simNodes[e.data.index].fy = null;
-        }
+        // No physics to release into
     }
 
     if (type === 'stop') {
-        if (simulation) simulation.stop();
+        // Already stopped
     }
 
     if (type === 'updateConfig') {
-        if (!simulation) return;
-        const { repulsion, distance } = config;
-        if (repulsion !== undefined) simulation.force("charge").strength(repulsion);
-        if (distance !== undefined) simulation.force("link").distance(d => {
-            return distance * (0.7 + Math.random() * 0.6);
-        });
-        simulation.alpha(0.3).restart();
+        // Static layout doesn't update dynamically
     }
 };
 

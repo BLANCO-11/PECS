@@ -2,9 +2,6 @@ class AlphaConfig:
 
     # Identity Parameters
     MAX_BELIEFS = 100000
-    MAX_EDGES = 400000
-    MAX_DEPTH = 5
-    CONTRADICTION_THRESHOLD = 0.6
 
     # Confidence Hyperparameters
     ALPHA = 1.0
@@ -13,13 +10,12 @@ class AlphaConfig:
     DELTA = 0.5
 
     # Activation limits
-    TOP_K_ACTIVATION = 8
-    TOP_K_DEEP_THINK = 18
+    TOP_K_ACTIVATION = 10
+    TOP_K_DEEP_THINK = 20
 
     # Reasoning limits
-    FACT_SELECTOR_LIMIT = 30
-    MAX_REASON_FACTS = 25
-    MIN_REASON_FACTS = 10
+    FACT_SELECTOR_LIMIT = 50
+    MAX_REASON_FACTS = 35
     
     # Graph limits
     MAX_GRAPH_SIZE = 500
@@ -43,30 +39,28 @@ class AlphaConfig:
 
     # Research limits
     RESEARCH_MAX_TIME_SECONDS = 30
-    RESEARCH_MAX_TIME_DEEPTHINK_SECONDS = 120
+    RESEARCH_MAX_TIME_DEEPTHINK_SECONDS = 60
     RESEARCH_IGNORE_TIME_LIMIT = False
     RESEARCH_MAX_SOURCES = 3
     RESEARCH_MAX_SOURCES_DEEPTHINK = 6
 
-    MAX_NEWS_HEADLINES = 5
+    MAX_NEWS_HEADLINES = 3
     MAX_CHUNK_SIZE = 4000
+    MAX_TRIPLE_PART_LENGTH = 100
 
     # Debug
     DEBUG_TOKENS = True
     DEBUG_REASONING = False
-
-    # Reasoning triggers
-    REASONING_TRIGGERS = {
-        "why","how","cause","reason","effect",
-        "relationship","related","connect","link",
-        "difference","compare"
-    }
 
     INVERSE_PREDICATES = {
         "is_a": "not_is_a",
         "caused_by": "prevents",
         "has": "not_has",
         "likes": "dislikes"
+    }
+
+    MUTUALLY_EXCLUSIVE_PREDICATES = {
+        "is_a", "born_in", "located_in", "capital_of", "died_in"
     }
 
     # LLM Models

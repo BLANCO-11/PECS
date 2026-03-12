@@ -1,37 +1,36 @@
 import re
 import json
 import spacy
-from typing import List, Tuple, Dict, Optional
+from typing import Any, List, Tuple, Dict, Optional
 from groq import Groq
 from utils.config import AlphaConfig
-
-# --- CPU OPTIMIZATION: Load only essential pipes ---
-# We disable 'ner' (Named Entity Recognition) because it is computationally expensive
-# and we are strictly doing grammatical dependency parsing here.
-try:
-    # Check if model exists
-    if not spacy.util.is_package("en_core_web_sm"):
-        print("[System] Downloading optimized Spacy model...")
-        from spacy.cli import download
-        download("en_core_web_sm")
-    
-    # LOAD WITH OPTIMIZATIONS
-    nlp = spacy.load("en_core_web_sm", disable=["ner", "textcat"])
-    print("[System] Spacy loaded (CPU Optimized: NER disabled)")
-    
-except Exception as e:
-    print(f"[System] Warning: Spacy load failed ({e}). Falling back to Regex.")
-    nlp = None
 
 class SpacyExtractor:
     """
     Optimized linguistic parser. 
     Performance: ~10ms per sentence on CPU.
     """
+    def __init__(self):
+        self.nlp = None
+        try:
+            # Check if model exists
+            if not spacy.util.is_package("en_core_web_sm"):
+                print("[System] Downloading optimized Spacy model...")
+                from spacy.cli import download
+                download("en_core_web_sm")
+            
+            # LOAD WITH OPTIMIZATIONS
+            # We disable 'ner' (Named Entity Recognition) because it is computationally expensive
+            # and we are strictly doing grammatical dependency parsing here.
+            self.nlp = spacy.load("en_core_web_sm", disable=["ner", "textcat"])
+            print("[System] Spacy loaded (CPU Optimized: NER disabled)")
+        except Exception as e:
+            print(f"[System] Warning: Spacy load failed ({e}). Falling back to Regex.")
+
     def process(self, text: str) -> List[Tuple]:
-        if not nlp: return [] # Safety fallback
+        if not self.nlp: return [] # Safety fallback
         
-        doc = nlp(text)
+        doc = self.nlp(text)
         triples = []
 
         for token in doc:
@@ -108,6 +107,18 @@ class LLMExtractor:
         self.client = Groq(api_key=api_key)
         self.token_callback = token_callback
 
+    def _parse_json_response(self, content: str) -> Any:
+        """Helper to robustly parse JSON from LLM output, handling markdown blocks."""
+        try:
+            # Strip markdown code blocks if present
+            content = re.sub(r'^```json\s*', '', content, flags=re.MULTILINE)
+            content = re.sub(r'^```\s*', '', content, flags=re.MULTILINE)
+            # Attempt to fix trailing commas which LLMs often output
+            content = re.sub(r',\s*([\]}])', r'\1', content)
+            return json.loads(content.strip())
+        except json.JSONDecodeError:
+            return None
+
     def _record_usage(self, completion, label="LLM"):
 
         if hasattr(completion, "usage") and completion.usage:
@@ -158,7 +169,8 @@ class LLMExtractor:
                 response_format={"type": "json_object"}
             )
             self._record_usage(completion)
-            return json.loads(completion.choices[0].message.content)
+            result = self._parse_json_response(completion.choices[0].message.content)
+            return result if result else {"proposed_beliefs": []}
         except Exception as e:
             print(f"LLM Error: {e}")
             return {"proposed_beliefs": []}
@@ -284,7 +296,7 @@ class LLMExtractor:
             if verbose and completion.usage:
                 u = completion.usage
                 print(f"  [LLM Merge]   Prompt: {u.prompt_tokens} | Completion: {u.completion_tokens} | Total: {u.total_tokens}")
-            result = json.loads(completion.choices[0].message.content)
+            result = self._parse_json_response(completion.choices[0].message.content) or {}
             
             candidates = []
             if isinstance(result, list):
@@ -336,7 +348,7 @@ class LLMExtractor:
             if verbose and completion.usage:
                 u = completion.usage
                 print(f"  [LLM Plan]    Prompt: {u.prompt_tokens} | Completion: {u.completion_tokens} | Total: {u.total_tokens}")
-            result = json.loads(completion.choices[0].message.content)
+            result = self._parse_json_response(completion.choices[0].message.content) or {}
             return result.get("sub_topics", [])
         except Exception as e:
             print(f"Research Planning Error: {e}")
@@ -419,7 +431,7 @@ class LLMExtractor:
                 response_format={"type": "json_object"}
             )
             self._record_usage(completion)
-            result = json.loads(completion.choices[0].message.content)
+            result = self._parse_json_response(completion.choices[0].message.content) or {}
             ids = result.get("contradicting_ids", [])
             return [candidate_pairs[i] for i in ids if i < len(candidate_pairs)]
         except Exception:
@@ -465,7 +477,6 @@ class LLMExtractor:
 
         self._record_usage(completion,"FactSelect")
 
-        result = json.loads(completion.choices[0].message.content)
+        result = self._parse_json_response(completion.choices[0].message.content) or {}
 
         return result.get("facts",[])
-

@@ -1,4 +1,5 @@
 import re
+import threading
 import time
 import random
 from collections import deque
@@ -12,6 +13,9 @@ from rapidfuzz import process, fuzz
 import utils.tools as tools
  
 class PECSCore:
+    # Singleton cache for heavy extractors to prevent reloading on every instance
+    _spacy_instance = None
+
     def __init__(self, groq_api_key: str, deep_think_mode: bool = False, event_handler=None):
         self.memory = MemoryStore()
         self.event_handler = event_handler
@@ -22,7 +26,10 @@ class PECSCore:
 
         # OPTIMIZATION: Initialize Spacy Extractor
         from utils.extractors import SpacyExtractor, SymbolicExtractor
-        self.spacy_extractor = SpacyExtractor()
+        
+        if PECSCore._spacy_instance is None:
+            PECSCore._spacy_instance = SpacyExtractor()
+        self.spacy_extractor = PECSCore._spacy_instance
         
         self.symbolic = SymbolicExtractor()
         self.llm = LLMExtractor(groq_api_key, token_callback=self._handle_token_update)
@@ -36,14 +43,25 @@ class PECSCore:
         self.current_interaction_llm_calls = 0
         self.session_new_beliefs_count = 0
         self.interaction_logs = [] # Capture logs for the frontend
+        self._subject_cache = set() # Cache for entity resolution to avoid O(N) DB lookups
+        self.session_total_tokens = 0 # Accumulator for session tokens
+        self.autonomous_running = False
+        self.autonomous_thread = None
 
+        self._subject_cache_timestamp = 0
 
     def _correct_tokens(self, tokens):
         """
         Attempts fuzzy correction of tokens against known belief subjects.
         """
-        beliefs = self.memory.get_all_beliefs()
-        subjects = list({b['subject'] for b in beliefs if b.get('subject')})
+        # Lazy load cache if empty
+        # Refresh cache occasionally (every 5 mins) to pick up new entities
+        if not self._subject_cache or (time.time() - self._subject_cache_timestamp > 300):
+            beliefs = self.memory.get_all_beliefs()
+            self._subject_cache = {b['subject'] for b in beliefs if b.get('subject')}
+            self._subject_cache_timestamp = time.time()
+        
+        subjects = list(self._subject_cache)
 
         corrected = []
 
@@ -56,16 +74,28 @@ class PECSCore:
 
         return corrected
 
+    def _emit_activity(self, message: str):
+        """Emits a real-time activity update to the UI."""
+        if self.event_handler:
+            try:
+                self.event_handler('activity_update', {'log': message})
+            except Exception:
+                pass # Suppress socket errors to prevent crashing the thread
+
     def log(self, message: str):
         """Logs a message to both console and the interaction log list."""
-        print(message)
+        print(message, flush=True)
         self.interaction_logs.append(str(message))
+        # Heuristic: Emit significant status updates to the UI activity stream
+        if self.event_handler and any(str(message).strip().startswith(tag) for tag in ["[Research]", "[Goal]", "[Inner Voice]", "[Attention]", "[System]", "[Server]", "[Batch Learn]", "---", "Error"]):
+            self._emit_activity(str(message).strip())
         
     # --- NEW METHOD ---
     def _handle_token_update(self, total_tokens: int):
         """Passes token usage from LLMExtractor to the server via event handler."""
+        self.session_total_tokens += total_tokens
         if self.event_handler:
-            self.event_handler('token_update', {'total': total_tokens})
+            self.event_handler('token_update', {'total': self.session_total_tokens})
         
         
     def learn(self, user_input: str, verbose: bool = False, focus_topic: str = None, prune: bool = True) -> List[Tuple]:
@@ -127,6 +157,9 @@ class PECSCore:
         newly_created_ids = []
         new_belief_content = {}
         contradiction_candidates = [] 
+
+        # OPTIMIZATION: Collect events to emit in a single batch
+        batch_events = []
         
         for subj, pred, obj in validated_triples:
             # Normalize
@@ -149,16 +182,20 @@ class PECSCore:
                             'fact2': (pc['subject'], pc['predicate'], pc['object'])
                         })
 
-                if self.event_handler:
-                    self.event_handler('belief_created', {
+                batch_events.append({
+                    'type': 'belief_created', 'data': {
                         'id': b_id, 'subject': subj, 'predicate': pred, 'object': obj,
                         'evidence_score': 1.0, 'usage_count': 0
-                    })
+                    }})
+
                 newly_created_ids.append(b_id)
                 new_belief_content[b_id] = (subj, obj)
+                self._subject_cache.add(subj) # Update cache incrementally
+
             else:
-                if self.event_handler:
-                    self.event_handler('belief_strengthened', {'id': b_id})
+                batch_events.append({
+                    'type': 'belief_strengthened', 'data': {'id': b_id}
+                })
 
         # --- EXECUTE BATCHED CONTRADICTION CHECK ---
         if contradiction_candidates:
@@ -167,14 +204,14 @@ class PECSCore:
             
             for pair in actual_contradictions:
                 edge_id = self.memory.mark_contradiction(pair['new_id'], pair['existing_id'])
-                if self.event_handler and edge_id:
-                    self.event_handler('edge_created', {
+                if edge_id:
+                    batch_events.append({
+                        'type': 'edge_created', 'data': {
                         'id': edge_id, 'source_id': pair['new_id'], 
                         'target_id': pair['existing_id'], 'type': 'contradicts'
-                    })
+                    }})
 
         # 6. Semantic Linking (Context & Rooting)
-        new_edges_events = []
         
         for new_id in newly_created_ids:
             n_subj, n_obj = new_belief_content[new_id]
@@ -186,10 +223,11 @@ class PECSCore:
                     
                     if not n_tokens.isdisjoint(c_tokens):
                         edge_id = self.memory.add_edge(source_id=context_belief['id'], target_id=new_id, edge_type='related_to', weight=0.5)
-                        new_edges_events.append({
-                            'id': edge_id, 'source_id': context_belief['id'], 
-                            'target_id': new_id, 'type': 'related_to'
-                        })
+                        batch_events.append({
+                            'type': 'edge_created', 'data': {
+                                'id': edge_id, 'source_id': context_belief['id'], 
+                                'target_id': new_id, 'type': 'related_to'
+                        }})
 
         if focus_topic and newly_created_ids:
             focus_tokens = [t for t in re.findall(r'\w+', focus_topic.lower()) if t not in AlphaConfig.STOP_WORDS]
@@ -200,16 +238,17 @@ class PECSCore:
                     for new_id in newly_created_ids:
                         if new_id != root_id:
                             edge_id = self.memory.add_edge(source_id=root_id, target_id=new_id, edge_type='has_context', weight=0.8)
-                            new_edges_events.append({
-                                'id': edge_id, 'source_id': root_id, 
-                                'target_id': new_id, 'type': 'has_context'
-                            })
+                            batch_events.append({
+                                'type': 'edge_created', 'data': {
+                                    'id': edge_id, 'source_id': root_id, 
+                                    'target_id': new_id, 'type': 'has_context'
+                            }})
         
         self.memory.conn.commit()
         
-        if self.event_handler:
-            for event in new_edges_events:
-                self.event_handler('edge_created', event)
+        # Emit all graph updates in one go
+        if self.event_handler and batch_events:
+            self.event_handler('graph_batch', batch_events)
 
         if prune:
             self.memory.prune_graph() 
@@ -223,7 +262,7 @@ class PECSCore:
         return extracted_triples
 
 
-    def batch_learn(self, text: str, verbose: bool = False, focus_topic: str = None) -> List[Tuple]:
+    def batch_learn(self, text: str, verbose: bool = False, focus_topic: str = None, start_time: float = None, time_limit: float = None) -> List[Tuple]:
         """
         Splits long text into chunks and learns from them sequentially.
         Efficient for ingesting news articles or documents.
@@ -235,10 +274,18 @@ class PECSCore:
         current_batch = []
         current_len = 0
         all_triples = []
+        time_exceeded = False
         
         for chunk in chunks:
             chunk = chunk.strip()
             if not chunk: continue
+            
+            # Check time limit
+            if start_time and time_limit:
+                if time.time() - start_time > time_limit:
+                    self.log(f"[Batch Learn] ⏳ Time limit exceeded. Stopping batch processing.")
+                    time_exceeded = True
+                    break
             
             # Group chunks into blocks of ~500 chars for efficient LLM extraction
             if current_len + len(chunk) > 1000:
@@ -252,14 +299,14 @@ class PECSCore:
                 current_len += len(chunk)
         
         # Process remaining
-        if current_batch:
+        if current_batch and not time_exceeded:
             triples = self.learn(" ".join(current_batch), verbose, focus_topic=focus_topic, prune=False)
             all_triples.extend(triples)
             
         self.memory.prune_graph() # Prune once at the end of the batch
 
         # Check for consolidation at the end of the batch operation.
-        if self.session_new_beliefs_count >= AlphaConfig.CONSOLIDATION_THRESHOLD:
+        if not time_exceeded and self.session_new_beliefs_count >= AlphaConfig.CONSOLIDATION_THRESHOLD:
             self.log(f"\n[System] Resting period: Consolidating after batch learning ({self.session_new_beliefs_count} new beliefs)...")
             self.consolidate(verbose=verbose)
             self.session_new_beliefs_count = 0 # Reset counter
@@ -356,7 +403,7 @@ class PECSCore:
         # --- Autonomous Self-Correction ---
         if not raw_context:
             proper_nouns = re.findall(r'\b[A-Z][a-zA-Z0-9]+\b', user_input)
-            keywords = [t for t in proper_nouns if t.lower() not in AlphaConfig.STOP_WORDS and len(t) > 3]
+            keywords = [t for t in proper_nouns if t.lower() not in AlphaConfig.STOP_WORDS and len(t) >= 2]
             
             if keywords:
                 keywords.sort(key=len, reverse=True)
@@ -505,6 +552,27 @@ class PECSCore:
             # Restore original deep think mode
             self.deep_think_mode = original_deep_think_mode
 
+    def _find_merge_candidates(self, beliefs: List[Dict]) -> List[Dict]:
+        """
+        Filters a list of beliefs to find those with similar subjects, 
+        reducing LLM noise and token usage.
+        """
+        from rapidfuzz import fuzz
+        keep_ids = set()
+        n = len(beliefs)
+        
+        for i in range(n):
+            for j in range(i + 1, n):
+                b1 = beliefs[i]
+                b2 = beliefs[j]
+                # Check Subject Similarity
+                subj_score = fuzz.ratio(b1['subject'].lower(), b2['subject'].lower())
+                if subj_score > 85:
+                    keep_ids.add(b1['id'])
+                    keep_ids.add(b2['id'])
+        
+        return [b for b in beliefs if b['id'] in keep_ids]
+
     def consolidate(self, verbose: bool = False):
         """
         Maintenance task: Looks for redundant beliefs and merges them.
@@ -532,18 +600,24 @@ class PECSCore:
         # 4. Fetch a batch of beliefs for merge consideration.
         # Fetching all beliefs is not scalable. Instead, fetch a sample of
         # recently added or frequently accessed beliefs.
-        # For this example, we'll fetch the 100 most recently updated beliefs.
+        # OPTIMIZATION: Fetch larger batch (500), filter locally, send small batch to LLM.
         if hasattr(self.memory, 'get_beliefs'):
-            candidate_beliefs = self.memory.get_beliefs(sort_by='last_accessed', limit=100)
+            candidate_beliefs = self.memory.get_beliefs(sort_by='last_accessed', limit=500)
         else:
             # Fallback: Sort in memory using all_beliefs from step 2
-            candidate_beliefs = sorted(all_beliefs, key=lambda x: x.get('last_accessed', x.get('id', 0)), reverse=True)[:100]
+            candidate_beliefs = sorted(all_beliefs, key=lambda x: x.get('last_accessed', x.get('id', 0)), reverse=True)[:500]
 
-        if len(candidate_beliefs) < 2: return
+        # Filter locally using fuzzy matching to save tokens
+        refined_candidates = self._find_merge_candidates(candidate_beliefs)
+
+        if len(refined_candidates) < 2: 
+            if verbose: self.log("[Consolidate] No similar beliefs found locally.")
+            return
         
         # 4. Ask LLM for merges
         self.current_interaction_llm_calls += 1 # Tracking maintenance calls too
-        merges = self.llm.suggest_merges(candidate_beliefs[:AlphaConfig.TOP_K_DEEP_THINK], verbose=verbose) # Use a configurable limit
+        # Limit the LLM payload to a reasonable size (e.g. 30 items)
+        merges = self.llm.suggest_merges(refined_candidates[:30], verbose=verbose) 
         
         # 5. Apply merges
         for m in merges:
@@ -608,6 +682,9 @@ class PECSCore:
             start_time: Timestamp of when the top-level research began.
             plan_first: If True, creates a research plan and sub-goals instead of executing immediately.
         """
+        if start_time is None:
+            start_time = time.time()
+
         # --- Structural Research (Planning First) ---
         # If this is a top-level call and planning is requested, we plan first.
         # This applies to both user commands and autonomous goals (if they are "Research" goals).
@@ -634,13 +711,29 @@ class PECSCore:
             if not is_autonomous:
                 self.log(f"[Research] Interactive Mode: Executing main research goal immediately...")
                 self.research_topic(topic, depth=0, verbose=verbose, root_topic=root_topic, is_autonomous=is_autonomous, start_time=start_time, force=force, source=source, plan_first=False)
+                
+                # Execute the planned sub-topics immediately in interactive mode
+                if sub_topics:
+                    self.log(f"[Research] Interactive Mode: Executing {len(sub_topics)} planned sub-topics...")
+                    for sub_item in sub_topics:
+                        # Check time limit before starting next sub-topic
+                        time_limit = AlphaConfig.RESEARCH_MAX_TIME_DEEPTHINK_SECONDS if self.deep_think_mode else AlphaConfig.RESEARCH_MAX_TIME_SECONDS
+                        if not AlphaConfig.RESEARCH_IGNORE_TIME_LIMIT and (time.time() - start_time > time_limit):
+                             self.log(f"[Research] ⏳ Time budget exceeded. Skipping remaining sub-topics.")
+                             break
+
+                        # Handle both string and dict formats (resilience)
+                        sub_name = sub_item if isinstance(sub_item, str) else sub_item.get('topic')
+                        if sub_name:
+                             self.research_topic(sub_name, depth=1, verbose=verbose, root_topic=root_topic, is_autonomous=is_autonomous, start_time=start_time, force=force, source=source, plan_first=False)
             else:
                 self.log(f"[Research] Autonomous discovery will proceed with these goals.")
             
+            # Ensure consolidation happens after a major research plan is created/executed
+            if depth == 0:
+                self.consolidate(verbose=verbose)
+            
             return # The planning is done. The autonomous loop will execute the created goals.
-
-        if start_time is None:
-            start_time = time.time()
 
         # Check Knowledge Base (Deduplication)
         if not force:
@@ -708,7 +801,7 @@ class PECSCore:
                         content = f"{res['title']}: {res['summary']}"
                         
                     focus = root_topic if root_topic else topic
-                    triples = self.batch_learn(content, verbose=verbose, focus_topic=focus)
+                    triples = self.batch_learn(content, verbose=verbose, focus_topic=focus, start_time=start_time, time_limit=time_limit)
                     learned_triples.extend(triples)
                 learned_something = True
             else:
@@ -725,7 +818,7 @@ class PECSCore:
                 self.log(f"[Research] Reading summary ({len(summary)} chars)...")
                 snippet = summary[:AlphaConfig.MAX_CHUNK_SIZE] 
                 focus = root_topic if root_topic else topic
-                triples = self.batch_learn(snippet, verbose=verbose, focus_topic=focus)
+                triples = self.batch_learn(snippet, verbose=verbose, focus_topic=focus, start_time=start_time, time_limit=time_limit)
                 learned_triples.extend(triples)
                 learned_something = True
             else:
@@ -743,6 +836,12 @@ class PECSCore:
         # If we are exploring a sub-topic or no plan was made, follow interesting sparks.
         sparks = self._identify_curiosity_sparks(learned_triples)
         for spark in list(sparks)[:2]: # Limit to top 2 sparks
+            # Check time limit before starting a new spark investigation
+            if start_time and not AlphaConfig.RESEARCH_IGNORE_TIME_LIMIT:
+                 if time.time() - start_time > time_limit:
+                     if verbose: self.log(f"[Research] ⏳ Time budget exceeded. Skipping curiosity sparks.")
+                     break
+
             if is_autonomous:
                 # Autonomous Mode: Fine to sway away.
                 # Instead of diving NOW (which distracts from current topic), add as a FUTURE goal.
@@ -753,11 +852,14 @@ class PECSCore:
                 # Only dive if strictly relevant to the root topic.
                 if root_topic and self.llm.check_relevance(root_topic, spark, verbose=verbose):
                     self.log(f"[Research] Focused: '{spark}' is relevant to '{root_topic}'. Diving deeper...")
-                    # Do not pass start_time, so each sub-topic gets its own fresh time budget.
-                    # The depth limit prevents infinite recursion.
-                    self.research_topic(spark, depth=depth + 1, verbose=verbose, root_topic=root_topic, is_autonomous=False, source=source)
+                    # Pass start_time to enforce the global time budget across recursive calls
+                    self.research_topic(spark, depth=depth + 1, verbose=verbose, root_topic=root_topic, is_autonomous=False, start_time=start_time, source=source)
                 else:
                     if verbose: self.log(f"[Research] Focused: Ignoring '{spark}' (tangential).")
+
+        # Final consolidation check for this research session
+        if depth == 0:
+            self.consolidate(verbose=verbose)
 
     def read_news(self, verbose: bool = False):
         """
@@ -823,111 +925,164 @@ class PECSCore:
 
         self.log("\n[News] Session complete.")
 
+    def start_autonomous(self, verbose: bool = False):
+        """Starts the autonomous discovery loop in a background thread."""
+        if self.autonomous_running:
+            self.log("[System] Autonomous loop is already running.")
+            return
+        
+        self.log("[System] Starting autonomous discovery loop...")
+        self._emit_activity("[System] Autonomous Mode Started")
+        self.autonomous_running = True
+        self.autonomous_thread = threading.Thread(target=self.autonomous_discovery, args=(verbose,), daemon=True)
+        self.autonomous_thread.start()
+
+    def stop_autonomous(self):
+        """Stops the autonomous discovery loop."""
+        if self.autonomous_running:
+            self.log("[System] Stopping autonomous discovery loop...")
+            self._emit_activity("[System] Autonomous Mode Stopped")
+            self.autonomous_running = False
+            # Thread will exit gracefully on next loop check
+
     def autonomous_discovery(self, verbose: bool = False, max_cycles: int = None):
         """
         The 'Inner Voice' loop. Fetches news, learns, and decides if it needs to research more.
         """
-        print("\n--- 🧠 Starting Autonomous Discovery Loop (Press Ctrl+C to stop) ---")
-        try:
-            import utils.tools as tools # Lazy import to avoid circular dependencies if any
-        except ImportError:
-            print("[System] Warning: 'tools.py' not found. External news scanning will be skipped.")
-            tools = None
-        import time
+        self.log("\n--- 🧠 Autonomous Discovery Loop Active ---")
         
-        seen_urls = set()
-        cycles = 0
-        
+        # Wrap entire thread logic to catch startup crashes (e.g. bad imports)
         try:
-            while True:
-                if max_cycles and cycles >= max_cycles:
-                    print(f"[System] Reached max autonomous cycles ({max_cycles}). Stopping.")
-                    break
-                cycles += 1
+            try:
+                import utils.tools as tools # Lazy import to avoid circular dependencies if any
+            except Exception as e:
+                self.log(f"[System] Warning: Could not load 'tools.py' ({e}). External news scanning will be skipped.")
+                tools = None
+            import time
+            
+            seen_urls = set()
+            cycles = 0
+            
+            while self.autonomous_running:
+                try:
+                    if max_cycles and cycles >= max_cycles:
+                        self.log(f"[System] Reached max autonomous cycles ({max_cycles}). Stopping.")
+                        self.autonomous_running = False
+                        break
+                    cycles += 1
 
-                # 0. Check Curiosity Trigger (Internal Drive)
-                self.evaluate_curiosity_trigger(verbose)
+                    # 0. Check Curiosity Trigger (Internal Drive)
+                    try:
+                        self.evaluate_curiosity_trigger(verbose)
+                    except Exception:
+                        pass # Ignore curiosity errors (like DB threading) to keep loop alive
 
-                # 1. Goal Execution (Priority)
-                next_goal = self.memory.get_next_goal()
-                if next_goal:
-                    print(f"\n[Goal] Executing: {next_goal['description']}")
-                    
-                    if next_goal['description'].startswith("Research "):
-                        topic = next_goal['description'].replace("Research ", "")
-                        # "Research" implies we should plan it out first.
-                        self.research_topic(topic, verbose=verbose, is_autonomous=True, plan_first=True)
-                        self.memory.complete_goal(next_goal['id'])
-                        print(f"[Goal] Marked '{next_goal['description']}' as achieved.")
-                    
-                    elif next_goal['description'].startswith("Execute Research "):
-                        topic = next_goal['description'].replace("Execute Research ", "")
-                        # "Execute Research" implies the planning is done, just do the work.
-                        self.research_topic(topic, verbose=verbose, is_autonomous=True, plan_first=False)
-                        self.memory.complete_goal(next_goal['id'])
-                        print(f"[Goal] Marked '{next_goal['description']}' as achieved.")
+                    # 1. Goal Execution (Priority)
+                    try:
+                        next_goal = self.memory.get_next_goal()
+                    except Exception as e:
+                        # If locking is working, this shouldn't happen, but good to keep as failsafe
+                        if "thread" in str(e).lower() or "recursive" in str(e).lower():
+                            self.log(f"[System] Critical: Database threading error. Ensure MemoryStore(check_same_thread=False). Stopping.")
+                            self.autonomous_running = False
+                            break
+                        raise e
 
-                    elif next_goal['description'].startswith("Deep Dive "):
-                        # Container goal for a research plan. Mark as achieved to unblock sub-goals.
-                        self.memory.complete_goal(next_goal['id'])
-                        print(f"[Goal] Processed container: '{next_goal['description']}'.")
-                    
-                    # Short pause between goals, then loop back to check for more goals
-                    time.sleep(2) 
-                    continue
-
-                # 2. Fetch News (Idle behavior)
-                if tools:
-                    print("\n[Inner Voice] No pending goals. Scanning global news feeds...")
-                    news_items = tools.fetch_rss_news()
-                else:
-                    print("\n[Inner Voice] No pending goals. Reflecting on internal knowledge...")
-                    news_items = []
-                
-                if not news_items:
-                    print("No news found or connection failed.")
-                    news_items = []
-
-                new_items_count = 0
-                for item in news_items:
-                    headline = item['title']
-                    url = item['link']
-                    
-                    if url in seen_urls:
-                        continue
-                    
-                    seen_urls.add(url)
-                    new_items_count += 1
-                    
-                    print(f"\n[Attention] Found headline: '{headline}'")
-                    
-                    # 2. Initial Learn (Surface Level)
-                    triples = self.learn(headline, verbose=False)
-                    
-                    # 3. Curiosity Check (The Inner Voice)
-                    unknown_subjects = self._identify_curiosity_sparks(triples)
-                    
-                    if unknown_subjects:
-                        # 4. Action: Research
-                        print(f"\n[Inner Voice] I learned something new about {list(unknown_subjects)}. I feel curious to know more.")
-                        # Note: We skip reading the full news article here to focus on the goal-based research
-                        # which is cleaner. If you want to read the news article too, you'd need a robust scraper.
-                        # For now, we rely on the headline for the "spark" and Wikipedia for the "deep dive".
+                    if next_goal:
+                        self.log(f"\n[Goal] Executing: {next_goal['description']}")
                         
-                        # Create a goal for deep dive instead of immediate action
-                        focus_topic = list(unknown_subjects)[0]
-                        print(f"[Inner Voice] Creating goal: Research '{focus_topic}'")
-                        self.memory.add_goal(f"Research {focus_topic}", priority=5)
-                    else:
-                        print("[Inner Voice] I am already familiar with these concepts. Moving on.")
-                
-                if new_items_count == 0:
-                    print("No new headlines found. Sleeping...")
-                
-                time.sleep(60)
+                        if next_goal['description'].startswith("Research "):
+                            topic = next_goal['description'].replace("Research ", "")
+                            # "Research" implies we should plan it out first.
+                            self.research_topic(topic, verbose=verbose, is_autonomous=True, plan_first=True)
+                            self.memory.complete_goal(next_goal['id'])
+                            self.log(f"[Goal] Marked '{next_goal['description']}' as achieved.")
+                        
+                        elif next_goal['description'].startswith("Execute Research "):
+                            topic = next_goal['description'].replace("Execute Research ", "")
+                            # "Execute Research" implies the planning is done, just do the work.
+                            self.research_topic(topic, verbose=verbose, is_autonomous=True, plan_first=False)
+                            self.memory.complete_goal(next_goal['id'])
+                            self.log(f"[Goal] Marked '{next_goal['description']}' as achieved.")
 
-        except KeyboardInterrupt:
-            print("\n[System] Autonomous discovery stopped by user.")
+                        elif next_goal['description'].startswith("Deep Dive "):
+                            # Container goal for a research plan. Mark as achieved to unblock sub-goals.
+                            self.memory.complete_goal(next_goal['id'])
+                            self.log(f"[Goal] Processed container: '{next_goal['description']}'.")
+                        
+                        # Short pause between goals, then loop back to check for more goals
+                        time.sleep(2)
+                        continue
+
+                    # 2. Fetch News (Idle behavior)
+                    if tools:
+                        self.log("[Inner Voice] Scanning global news feeds...")
+                        try:
+                            news_items = tools.fetch_rss_news()
+                        except Exception as e:
+                            self.log(f"[System] Error fetching news: {e}")
+                            news_items = []
+                    else:
+                        self.log("[Inner Voice] Reflecting on internal knowledge (No external tools)...")
+                        news_items = []
+                    
+                    if not news_items:
+                        # self.log("No news found or connection failed.") # Reduce spam
+                        news_items = []
+
+                    new_items_count = 0
+                    for item in news_items:
+                        if not self.autonomous_running: break
+
+                        headline = item['title']
+                        url = item['link']
+                        
+                        if url in seen_urls:
+                            continue
+                        
+                        seen_urls.add(url)
+                        new_items_count += 1
+                        
+                        self.log(f"\n[Attention] Found headline: '{headline}'")
+                        
+                        # 2. Initial Learn (Surface Level)
+                        triples = self.learn(headline, verbose=False)
+                        
+                        # 3. Curiosity Check (The Inner Voice)
+                        unknown_subjects = self._identify_curiosity_sparks(triples)
+                        
+                        if unknown_subjects:
+                            # 4. Action: Research
+                            self.log(f"\n[Inner Voice] I learned something new about {list(unknown_subjects)}. I feel curious to know more.")
+                            # Note: We skip reading the full news article here to focus on the goal-based research
+                            # which is cleaner. If you want to read the news article too, you'd need a robust scraper.
+                            # For now, we rely on the headline for the "spark" and Wikipedia for the "deep dive".
+                            
+                            # Create a goal for deep dive instead of immediate action
+                            focus_topic = list(unknown_subjects)[0]
+                            self.log(f"[Inner Voice] Creating goal: Research '{focus_topic}'")
+                            self.memory.add_goal(f"Research {focus_topic}", priority=5)
+                        else:
+                            self.log("[Inner Voice] I am already familiar with these concepts. Moving on.")
+                    
+                    if new_items_count == 0:
+                        # self.log("No new headlines found. Sleeping...") # Reduce spam
+                        pass
+                    
+                    # Interruptible sleep (check every second for 60 seconds)
+                    for _ in range(60):
+                        if not self.autonomous_running: break
+                        time.sleep(1)
+                except Exception as e:
+                    self.log(f"[System] Autonomous loop error: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    time.sleep(5) # Pause before retrying
+        except Exception as e:
+            self.log(f"[System] Autonomous loop crashed: {e}")
+            import traceback
+            traceback.print_exc()
+            self.autonomous_running = False
 
     def _identify_curiosity_sparks(self, triples: List[Tuple]) -> set:
         """Identifies subjects in the provided triples that the system knows very little about."""
@@ -1058,7 +1213,8 @@ class PECSCore:
         # The new logic correctly tokenizes the entire input string to gather all potential keywords,
         # ensuring a more comprehensive context is retrieved.
         all_words = re.findall(r'\w+', text.lower())
-        tokens = [t for t in all_words if t not in AlphaConfig.STOP_WORDS and len(t) > 3]
+        # OPTIMIZATION: Filter out numbers and very short words to improve context quality
+        tokens = [t for t in all_words if t not in AlphaConfig.STOP_WORDS and len(t) >= 3 and not t.isdigit()]
         tokens = self._correct_tokens(tokens)
         
         # Filter out generic entity types (e.g. "system", "group") to prevent context pollution

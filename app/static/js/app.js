@@ -7,6 +7,7 @@ const socket = io();
 
 // Data & State
 let nodes = [];
+let hubNodes = [];
 let links = [];
 let simulationWorker = null;
 let canvas, ctx;
@@ -24,7 +25,11 @@ let linkedNeighbors = new Set();
 let activationLevels = new Map();
 let nodeMap = new Map(); // Optimization for lookups
 let pulsePhase = 0;
+let spatialGrid = new Map();
+const GRID_SIZE = 1000; // Bucket size for spatial indexing
 let totalTokens = 0;
+let updateTimeout = null;
+let lastFrameTime = 0;
 
 // Configuration - Deep Slate Theme
 const CONFIG = {
@@ -120,6 +125,12 @@ function initCanvas() {
                     nodes[i].x = positions[i * 2];
                     nodes[i].y = positions[i * 2 + 1];
                 }
+                // Update grid on movement (drag)
+                if (nodes.length < 50000) updateSpatialGrid(); 
+            }
+            if (e.data.type === 'end') {
+                updateSpatialGrid();
+                requestAnimationFrame(render);
             }
         }
     };
@@ -226,6 +237,9 @@ function mergeGraphData(data) {
 
     nodes = newNodes;
     links = newLinks;
+    
+    // Cache hubs for fast rendering when zoomed out
+    hubNodes = nodes.filter(n => n._isHub);
 
     updateClusterNav(); 
 
@@ -243,6 +257,31 @@ function mergeGraphData(data) {
     if(!pulsePhase) startAnimationLoop();
 }
 
+function updateSpatialGrid() {
+    spatialGrid.clear();
+    for (const node of nodes) {
+        const gx = Math.floor(node.x / GRID_SIZE);
+        const gy = Math.floor(node.y / GRID_SIZE);
+        const key = `${gx},${gy}`;
+        if (!spatialGrid.has(key)) spatialGrid.set(key, []);
+        spatialGrid.get(key).push(node);
+    }
+}
+
+function triggerWorkerUpdate() {
+    if (updateTimeout) clearTimeout(updateTimeout);
+    updateTimeout = setTimeout(() => {
+        if (simulationWorker && renderingEnabled) {
+            simulationWorker.postMessage({
+                type: 'init',
+                nodes: nodes.map(n => ({id: n.id, x: n.x, y: n.y, degree: n.degree})),
+                links: links.map(l => ({source_id: l.source.id, target_id: l.target.id})),
+                config: { distance: CONFIG.physics.distance, repulsion: CONFIG.physics.repulsion }
+            });
+        }
+        updateTimeout = null;
+    }, 200);
+}
 
 // ==========================================
 // 3. UI LOGIC (CLUSTERS & ZOOM)
@@ -307,9 +346,14 @@ function focusOnNode(node) {
 // ==========================================
 
 function startAnimationLoop() {
-    const loop = () => {
+    const loop = (timestamp) => {
         if (!renderingEnabled) return requestAnimationFrame(loop);
-        pulsePhase += 0.05;
+        
+        if (!lastFrameTime) lastFrameTime = timestamp;
+        const dt = timestamp - lastFrameTime;
+        lastFrameTime = timestamp;
+
+        pulsePhase += dt * 0.003; // Time-based pulse for smoothness
         if(activationLevels.size > 0) {
             for(let [id, val] of activationLevels) {
                 // OPTIMIZATION: Faster decay for non-hubs (leaves fade out quickly)
@@ -319,13 +363,13 @@ function startAnimationLoop() {
                 else activationLevels.set(id, val);
             }
         }
-        render();
+        render(timestamp);
         requestAnimationFrame(loop);
     };
     requestAnimationFrame(loop);
 }
 
-function render() {
+function render(timestamp) {
     if (!renderingEnabled) return;
     ctx.fillStyle = CONFIG.color.bg;
     ctx.fillRect(0, 0, width, height);
@@ -377,23 +421,36 @@ function render() {
     let renderLinks = links;
     let renderNodes = nodes;
 
+    // OPTIMIZATION: When zoomed out, only process hubs to save CPU cycles
+    if (!useSpatialIndex && hideLeaves && hubNodes.length > 0) {
+        renderNodes = hubNodes;
+    }
+
     if (useSpatialIndex) {
         // Node-First Strategy: Find visible nodes -> Get their edges
         renderNodes = [];
         const visibleLinksSet = new Set();
+        
+        // Calculate grid bounds for viewport
+        const startX = Math.floor(minX / GRID_SIZE);
+        const endX = Math.floor(maxX / GRID_SIZE);
+        const startY = Math.floor(minY / GRID_SIZE);
+        const endY = Math.floor(maxY / GRID_SIZE);
 
-        for (const node of nodes) {
-            if (node.x >= minX && node.x <= maxX && node.y >= minY && node.y <= maxY) {
-                renderNodes.push(node);
-                for (const link of node.links) {
-                    visibleLinksSet.add(link);
+        for (let x = startX; x <= endX; x++) {
+            for (let y = startY; y <= endY; y++) {
+                const cell = spatialGrid.get(`${x},${y}`);
+                if (!cell) continue;
+                for (const node of cell) {
+                    if (node.x >= minX && node.x <= maxX && node.y >= minY && node.y <= maxY) {
+                        renderNodes.push(node);
+                        for (const link of node.links) visibleLinksSet.add(link);
+                    }
                 }
             }
         }
         
         renderLinks = Array.from(visibleLinksSet);
-        // Sort subset by importance to maintain LOD logic
-        renderLinks.sort((a, b) => b._importance - a._importance);
     }
 
     // --- SORT LINKS (OPTIMIZED) ---
@@ -404,7 +461,15 @@ function render() {
 
         // OPTIMIZATION: Strict culling as requested.
         // Only render edges if BOTH nodes are within the render area (screen + margin).
-        if (!sourceVisible || !targetVisible) continue;
+        if (highDetailZoom) {
+            if (!sourceVisible && !targetVisible) continue;
+        } else {
+            if (!sourceVisible || !targetVisible) continue;
+        }
+
+        // OPTIMIZATION: Don't render edges for nodes that are currently spawning (pulsing)
+        // This reduces visual clutter and improves performance during batch updates
+        if (link.source._spawnTime || link.target._spawnTime) continue;
 
         const isHovered = highlightedNode && (link.source === highlightedNode || link.target === highlightedNode);
         const isActive = (activationLevels.get(String(link.source.id))||0) > 0.1 || (activationLevels.get(String(link.target.id))||0) > 0.1;
@@ -522,9 +587,22 @@ function render() {
         ctx.beginPath();
         drawPath(al.link, false, dist); 
         if (al.link.type === 'contradicts') {
-            ctx.strokeStyle = '#ef4444'; 
+            ctx.strokeStyle = '#ef4444';
+            ctx.lineWidth = 1.5 / Math.max(transform.k, 0.01);
+            ctx.stroke();
         } else if (al.isActive) {
+            // 1. Base Glow
             ctx.strokeStyle = CONFIG.color.edge.active;
+            const widthBase = 1.5 + (pulse * 0.5);
+            ctx.lineWidth = widthBase / Math.max(transform.k, 0.01);
+            ctx.stroke();
+
+            // 2. Energy Flow Effect (Dashed Overlay)
+            ctx.strokeStyle = '#ffffff';
+            ctx.globalAlpha = 0.8;
+            ctx.setLineDash([4, 12]); // Short dash, long gap
+            ctx.lineDashOffset = -pulsePhase * 30; // Fast flow animation
+            ctx.lineWidth = (widthBase * 0.6) / Math.max(transform.k, 0.01);
         } else {
             ctx.strokeStyle = CONFIG.color.edge.highlight;
         }
@@ -533,6 +611,8 @@ function render() {
         const widthBase = al.isActive ? 1.0 + (pulse * 0.8) : 0.5 + (pulse * 0.5);
         ctx.lineWidth = Math.max(widthBase, 0.5) / Math.max(transform.k, 0.01);
         ctx.stroke();
+        ctx.setLineDash([]); // Reset
+        ctx.globalAlpha = 1.0;
     }
 
     let activeFont = ""; 
@@ -569,6 +649,28 @@ function render() {
         if (isHovered) r *= 1.3;
 
         if (extremeZoom) r = Math.max(r, 2 / transform.k);
+
+        // Spawn Animation (Elastic Pop-in)
+        if (node._spawnTime) {
+            const age = timestamp - node._spawnTime;
+            if (age < 1500) {
+                // Simple elastic ease-out
+                const t = age / 1500;
+                const scale = Math.pow(2, -10 * t) * Math.sin((t * 10 - 0.75) * (2 * Math.PI) / 3) + 1;
+                r *= Math.max(0, scale);
+
+                // Pulse Wave Effect
+                ctx.save();
+                ctx.beginPath();
+                ctx.arc(node.x, node.y, r * (1 + t * 8), 0, 2 * Math.PI);
+                ctx.strokeStyle = `rgba(${CONFIG.color.node.active}, ${1 - t})`;
+                ctx.lineWidth = 2 / transform.k;
+                ctx.stroke();
+                ctx.restore();
+            } else {
+                node._spawnTime = 0;
+            }
+        }
 
         ctx.beginPath();
         ctx.arc(node.x, node.y, r, 0, 2 * Math.PI);
@@ -705,13 +807,21 @@ function handleClick(e) {
 function findNode(x, y, radius) {
     let closest = null;
     let minDst = radius * radius;
-    for (const n of nodes) {
-        const dx = x - n.x;
-        const dy = y - n.y;
-        const dst = dx*dx + dy*dy;
-        if (dst < minDst) {
-            minDst = dst;
-            closest = n;
+    
+    const gx = Math.floor(x / GRID_SIZE);
+    const gy = Math.floor(y / GRID_SIZE);
+
+    // Check 3x3 grid cells around cursor
+    for (let i = -1; i <= 1; i++) {
+        for (let j = -1; j <= 1; j++) {
+            const cell = spatialGrid.get(`${gx+i},${gy+j}`);
+            if (!cell) continue;
+            for (const n of cell) {
+                const dx = x - n.x;
+                const dy = y - n.y;
+                const dst = dx*dx + dy*dy;
+                if (dst < minDst) { minDst = dst; closest = n; }
+            }
         }
     }
     return closest;
@@ -960,6 +1070,41 @@ socket.on('beliefs_activated', (ids) => {
     });
 });
 
+socket.on('graph_batch', (events) => {
+    let nodesAdded = false;
+    
+    events.forEach(e => {
+        if (e.type === 'belief_created') {
+            const newNode = e.data;
+            const nodeExists = nodes.some(n => n.id === newNode.id);
+            if (!nodeExists) {
+                const displayName = newNode.object ? newNode.object : newNode.subject;
+                nodes.push({
+                    id: newNode.id,
+                    label: displayName,
+                    raw: newNode,
+                    x: selectedNode ? nodes.find(n=>n.id===selectedNode)?.x + (Math.random()-0.5)*50 : (Math.random() - 0.5) * 500,
+                    y: selectedNode ? nodes.find(n=>n.id===selectedNode)?.y + (Math.random()-0.5)*50 : (Math.random() - 0.5) * 500,
+                    degree: 0,
+                    _spawnTime: performance.now()
+                });
+                activationLevels.set(String(newNode.id), 1.0);
+                nodesAdded = true;
+            }
+        } else if (e.type === 'edge_created') {
+            createEdge(e.data);
+        } else if (e.type === 'belief_strengthened') {
+            activationLevels.set(String(e.data.id), 1.0);
+        }
+    });
+
+    if (nodesAdded) {
+        updateClusterNav();
+        triggerWorkerUpdate();
+    }
+});
+
+// Kept for backward compatibility or single updates
 socket.on('belief_created', (newNode) => {
     const nodeExists = nodes.some(n => n.id === newNode.id);
     if (nodeExists) return;
@@ -972,23 +1117,21 @@ socket.on('belief_created', (newNode) => {
         raw: newNode,
         x: selectedNode ? nodes.find(n=>n.id===selectedNode)?.x + (Math.random()-0.5)*50 : (Math.random() - 0.5) * 500,
         y: selectedNode ? nodes.find(n=>n.id===selectedNode)?.y + (Math.random()-0.5)*50 : (Math.random() - 0.5) * 500,
-        degree: 0
+        degree: 0,
+        _spawnTime: performance.now() // Mark for animation
     });
 
     activationLevels.set(String(newNode.id), 1.0);
     updateClusterNav(); 
 
-    if (simulationWorker && renderingEnabled) {
-        simulationWorker.postMessage({
-            type: 'init',
-            nodes: nodes.map(n => ({id: n.id, x: n.x, y: n.y, degree: n.degree})),
-            links: links.map(l => ({source_id: l.source.id, target_id: l.target.id})),
-            config: { distance: CONFIG.physics.distance }
-        });
-    }
+    triggerWorkerUpdate();
 });
 
 socket.on('edge_created', (newEdge) => {
+    createEdge(newEdge);
+});
+
+function createEdge(newEdge) {
     const sourceNode = nodes.find(n => n.id === String(newEdge.source_id));
     const targetNode = nodes.find(n => n.id === String(newEdge.target_id));
 
@@ -997,23 +1140,27 @@ socket.on('edge_created', (newEdge) => {
         links.push({
             source: sourceNode,
             target: targetNode,
-            curveOffset: baseOffset * 2.5
+            curveOffset: baseOffset * 2.5,
+            _spawnTime: performance.now()
         });
         sourceNode.degree++;
         targetNode.degree++;
         
-        updateClusterNav(); 
-
-        if (simulationWorker && renderingEnabled) {
-            simulationWorker.postMessage({
-                type: 'init',
-                nodes: nodes.map(n => ({id: n.id, x: n.x, y: n.y, degree: n.degree})),
-                links: links.map(l => ({source_id: l.source.id, target_id: l.target.id})),
-                config: { distance: CONFIG.physics.distance }
-            });
+        // Immediate visual placement for new nodes
+        // If a node has degree 1, it means this is its first connection.
+        // Place it near the node it just connected to.
+        if (targetNode.degree === 1) {
+             targetNode.x = sourceNode.x + (Math.random() - 0.5) * 50;
+             targetNode.y = sourceNode.y + (Math.random() - 0.5) * 50;
+        } else if (sourceNode.degree === 1) {
+             sourceNode.x = targetNode.x + (Math.random() - 0.5) * 50;
+             sourceNode.y = targetNode.y + (Math.random() - 0.5) * 50;
         }
+
+        updateClusterNav(); 
+        triggerWorkerUpdate();
     }
-});
+}
 
 socket.on('belief_strengthened', (data) => {
     activationLevels.set(String(data.id), 1.0);
@@ -1033,7 +1180,7 @@ socket.on('token_update', (data) => {
     const container = document.getElementById('token-pill');
     
     // Update number
-    totalTokens += (data.total || 0);
+    totalTokens = (data.total || 0);
     el.innerText = totalTokens.toLocaleString();
     
     // Visual flash effect on update
@@ -1050,6 +1197,39 @@ socket.on('chat_response', (d) => {
     addMessage(d.response, 'ai', d.reasoning, d.logs); 
     updateStatus("Idle"); 
 });
+
+socket.on('activity_update', (data) => {
+    updateActivityLog(data.log);
+});
+
+function updateActivityLog(text) {
+    const hist = document.getElementById('chat-history');
+    let container = document.getElementById('live-activity-log');
+    
+    if (!container) {
+        container = document.createElement('div');
+        container.id = 'live-activity-log';
+        container.style.cssText = "margin: 10px 0; padding: 10px; background: rgba(255, 255, 255, 0.03); border-left: 2px solid #6366f1; font-family: monospace; font-size: 0.8rem; color: #94a3b8; border-radius: 4px;";
+        hist.appendChild(container);
+    }
+    
+    // Ensure it stays at the bottom
+    if (hist.lastElementChild !== container) {
+        hist.appendChild(container);
+    }
+
+    const line = document.createElement('div');
+    line.innerText = `> ${text}`;
+    line.style.cssText = "margin-bottom: 4px; white-space: pre-wrap; overflow-wrap: break-word;";
+    container.appendChild(line);
+    
+    // Sliding window: keep last 5 lines
+    while (container.children.length > 5) {
+        container.removeChild(container.firstChild);
+    }
+    
+    hist.scrollTop = hist.scrollHeight;
+}
 
 function addMessage(text, type, reasoning = null, logs = null) {
     const hist = document.getElementById('chat-history');

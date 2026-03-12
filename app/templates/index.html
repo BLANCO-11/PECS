@@ -25,6 +25,17 @@
         @keyframes pulse-opacity {
             0% { opacity: 0.4; } 50% { opacity: 1; } 100% { opacity: 0.4; }
         }
+
+        #auto-badge {
+            position: absolute; top: 100px; left: 50%; transform: translateX(-50%);
+            padding: 8px 16px; background: rgba(99, 102, 241, 0.2);
+            border: 1px solid #6366f1; border-radius: 20px;
+            color: #818cf8; font-family: 'Space Grotesk', sans-serif; font-size: 0.7rem;
+            letter-spacing: 0.1em; font-weight: 600;
+            opacity: 0; pointer-events: none; transition: opacity 0.3s;
+            box-shadow: 0 0 15px rgba(99, 102, 241, 0.3);
+        }
+        #auto-badge.visible { opacity: 1; animation: pulse-opacity 2s infinite; }
     </style>
 </head>
 <body>
@@ -54,7 +65,7 @@
             <div class="toggles">
                 <button class="toggle-btn" id="btn-verbose">VERBOSE</button>
                 <button class="toggle-btn" id="btn-deep">DEEP THINK</button>
-                <button class="toggle-btn" id="btn-auto">AUTO</button>
+                {% comment %} <button class="toggle-btn" id="btn-auto">AUTO</button> {% endcomment %}
             </div>
             <div class="input-box">
                 <textarea id="user-input" placeholder="Inject parameter..."></textarea>

@@ -55,7 +55,13 @@ class ActivationEngine:
         G = nx.DiGraph()
 
         for b in nodes:
-            G.add_node(b["id"], **b)
+            # Optimization: Only store necessary data in the graph object
+            G.add_node(b["id"], 
+                       subject=b.get("subject"),
+                       predicate=b.get("predicate"),
+                       object=b.get("object"),
+                       evidence_score=b.get("evidence_score", 1.0),
+                       structural_support_score=b.get("structural_support_score", 0.0))
 
         edge_count = 0
 
@@ -115,7 +121,8 @@ class ActivationEngine:
                 max_iter=100
             )
 
-        except Exception:
+        except Exception as e:
+            # Fallback to initial activation if PageRank fails (e.g. convergence issues)
             ppr = initial_activation
 
         # Normalize output scores relative to the best match (Max-Scaling)
