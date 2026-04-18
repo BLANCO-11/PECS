@@ -5,7 +5,7 @@ The purpose of this system is to dramatically reduce token usage when working wi
 
 
 # HOW TO RUN
-With UI - python -m app.server
+With UI - python main.py
 CLI - python cli.py
 
 
